@@ -1,2 +1,3 @@
 # libsql-rest
-Expose libSQL tables over http
+
+Expose libSQL (Turso) tables over http
