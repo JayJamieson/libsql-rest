@@ -1,6 +1,10 @@
 package db
 
-import "database/sql"
+import (
+	"database/sql"
+
+	_ "github.com/tursodatabase/libsql-client-go/libsql"
+)
 
 func New(dsn string) (*sql.DB, error) {
 	db, err := sql.Open("libsql", dsn)

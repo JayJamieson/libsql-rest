@@ -3,10 +3,13 @@ package server
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"time"
+
+	"github.com/JayJamieson/libsql-rest/internal/db"
 )
 
 type Config struct {
@@ -20,20 +23,48 @@ type Server struct {
 	db     *sql.DB
 }
 
-func New(cfg *Config, db *sql.DB) (*Server, error) {
+func New(cfg *Config, sqlDb *sql.DB) (*Server, error) {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/api/{table}/{relation...}", func(w http.ResponseWriter, r *http.Request) {
-		log.Print(r.URL.Path)
-		log.Print(r.PathValue("table"))
-		log.Print(r.PathValue("relation"))
-		w.Write([]byte("Success-relation"))
+		// Handle tables with a 1-M relation
+		// When relation is accessed, fetch all results FK to the {table} for {relation...}
+		w.Write([]byte("Ok"))
 	})
 
 	mux.HandleFunc("/api/{table}", func(w http.ResponseWriter, r *http.Request) {
-		log.Print(r.URL.Path)
-		log.Print(r.PathValue("table"))
-		w.Write([]byte("Success non-relation"))
+		// Think about how to add additional filtering capabilities similar to
+		// PostgREST https://postgrest.org/en/v12/references/api/tables_views.html#horizontal-filtering
+		// pRESTd https://docs.prestd.com/api-reference/advanced-queries
+
+		table := r.PathValue("table")
+
+		// TODO: Test sql inject and or escape input before fmt.Sprintf
+		rows, err := sqlDb.QueryContext(r.Context(), fmt.Sprintf("SELECT * FROM %s", table))
+
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		columns, _ := rows.Columns()
+		results := make([]map[string]interface{}, 0, len(columns))
+		defer rows.Close()
+
+		for rows.Next() {
+			row := make(map[string]interface{})
+			errScan := db.MapScan(rows, row)
+
+			if errScan != nil {
+				log.Printf("%v", errScan)
+				http.Error(w, errScan.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			results = append(results, row)
+		}
+
+		json.NewEncoder(w).Encode(results)
 	})
 
 	srv := &http.Server{
@@ -46,7 +77,7 @@ func New(cfg *Config, db *sql.DB) (*Server, error) {
 	return &Server{
 		server: srv,
 		cfg:    cfg,
-		db:     db,
+		db:     sqlDb,
 	}, nil
 }
 
