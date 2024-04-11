@@ -8,7 +8,15 @@ This repo is very much still a work in progress and currently testing viability.
 
 Things planned in no specificic order:
 
+- Basic crud
+  - list tables
+  - fetch single record
+  - fetch list of records
+  - update record
+  - create record
+  - delete record
 - Authentication and some form of RLS similar to Postresql
+  - JWT based auth
 - Basic filtering
   - pagination, limit results
   - ordering
