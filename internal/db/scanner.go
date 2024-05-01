@@ -1,6 +1,6 @@
 package db
 
-// ColScanner is an interface used by MapScan and SliceScan
+// ColScanner is an interface used by MapScan
 type ColScanner interface {
 	Columns() ([]string, error)
 	Scan(dest ...interface{}) error
