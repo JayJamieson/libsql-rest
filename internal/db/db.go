@@ -6,6 +6,8 @@ import (
 	_ "github.com/tursodatabase/libsql-client-go/libsql"
 )
 
+var MaxPageSize = 100
+
 func New(dsn string) (*sql.DB, error) {
 	db, err := sql.Open("libsql", dsn)
 

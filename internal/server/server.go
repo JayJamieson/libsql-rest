@@ -26,29 +26,23 @@ type Server struct {
 func New(cfg *Config, sqlDb *sql.DB) (*Server, error) {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/api/{table}/{relation...}", func(w http.ResponseWriter, r *http.Request) {
-		// Handle tables with a 1-M relation
-		// When relation is accessed, fetch all results FK to the {table} for {relation...}
-		w.Write([]byte("Ok"))
-	})
+	mux.HandleFunc("/api/tables", func(w http.ResponseWriter, r *http.Request) {
+		query := "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view')"
 
-	mux.HandleFunc("/api/{table}", func(w http.ResponseWriter, r *http.Request) {
-		// Think about how to add additional filtering capabilities similar to
-		// PostgREST https://postgrest.org/en/v12/references/api/tables_views.html#horizontal-filtering
-		// pRESTd https://docs.prestd.com/api-reference/advanced-queries
+		if r.URL.Query().Has("order") {
+			ordering := r.URL.Query().Get("order")
+			query = fmt.Sprintf("%s ORDER BY `name` %s", query, ordering)
+		}
 
-		table := r.PathValue("table")
-
-		// TODO: Test sql inject and or escape input before fmt.Sprintf
-		rows, err := sqlDb.QueryContext(r.Context(), fmt.Sprintf("SELECT * FROM %s", table))
+		rows, err := sqlDb.QueryContext(r.Context(), query)
 
 		if err != nil {
+			rows.Close()
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 
-		columns, _ := rows.Columns()
-		results := make([]map[string]interface{}, 0, len(columns))
+		results := make([]map[string]interface{}, 0, db.MaxPageSize)
 		defer rows.Close()
 
 		for rows.Next() {
@@ -64,7 +58,51 @@ func New(cfg *Config, sqlDb *sql.DB) (*Server, error) {
 			results = append(results, row)
 		}
 
-		json.NewEncoder(w).Encode(results)
+		json.NewEncoder(w).Encode(&Response{
+			Items: results,
+		})
+	})
+
+	mux.HandleFunc("/api/{table}", func(w http.ResponseWriter, r *http.Request) {
+		// Think about how to add additional filtering capabilities similar to
+		// PostgREST https://postgrest.org/en/v12/references/api/tables_views.html#horizontal-filtering
+		// pRESTd https://docs.prestd.com/api-reference/advanced-queries
+
+		table := r.PathValue("table")
+
+		// TODO: Fix possible SQL injections #8
+		log.Printf("SELECT * FROM `%s`\n", table)
+		rows, err := sqlDb.QueryContext(r.Context(), fmt.Sprintf("SELECT * FROM `%s`", table))
+
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		results := make([]map[string]interface{}, 0, db.MaxPageSize)
+		defer rows.Close()
+
+		for rows.Next() {
+			row := make(map[string]interface{})
+			errScan := db.MapScan(rows, row)
+
+			if errScan != nil {
+				log.Printf("%v", errScan)
+				http.Error(w, errScan.Error(), http.StatusInternalServerError)
+				return
+			}
+
+			results = append(results, row)
+		}
+		json.NewEncoder(w).Encode(&Response{
+			Items: results,
+		})
+	})
+
+	mux.HandleFunc("/api/{table}/{relation...}", func(w http.ResponseWriter, r *http.Request) {
+		// Handle tables with a 1-M relation
+		// When relation is accessed, fetch all results FK to the {table} for {relation...}
+		w.Write([]byte("Ok"))
 	})
 
 	srv := &http.Server{
