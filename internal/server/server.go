@@ -26,7 +26,7 @@ type Server struct {
 func New(cfg *Config, sqlDb *sql.DB) (*Server, error) {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/api/tables", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /api/tables", func(w http.ResponseWriter, r *http.Request) {
 		query := "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view')"
 
 		if r.URL.Query().Has("order") {
@@ -63,7 +63,50 @@ func New(cfg *Config, sqlDb *sql.DB) (*Server, error) {
 		})
 	})
 
-	mux.HandleFunc("/api/{table}", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("GET /api/{table}/{pk}", func(w http.ResponseWriter, r *http.Request) {
+		table := r.PathValue("table")
+		pk := r.PathValue("pk")
+
+		// TODO: Fix possible SQL injections #8
+		// introspect table to know what PK column to lookup and what type to cast to.
+		query := fmt.Sprintf("SELECT name, type FROM pragma_table_info('%s') WHERE pk = 1", table)
+		row := sqlDb.QueryRowContext(r.Context(), query)
+
+		var pkColumn string
+		var keyType string
+
+		err := row.Scan(&pkColumn, &keyType)
+
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		query = fmt.Sprintf("SELECT * FROM `%s` WHERE `%s` = ? LIMIT 1", table, pkColumn)
+		rowResult, err := sqlDb.QueryContext(r.Context(), query, pk)
+
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		result := make(map[string]interface{})
+
+		rowResult.Next()
+		errScan := db.MapScan(rowResult, result)
+
+		if errScan != nil {
+			http.Error(w, errScan.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		json.NewEncoder(w).Encode(&Response{
+			Items: result,
+		})
+
+	})
+
+	mux.HandleFunc("GET /api/{table}", func(w http.ResponseWriter, r *http.Request) {
 		// Think about how to add additional filtering capabilities similar to
 		// PostgREST https://postgrest.org/en/v12/references/api/tables_views.html#horizontal-filtering
 		// pRESTd https://docs.prestd.com/api-reference/advanced-queries
@@ -94,15 +137,10 @@ func New(cfg *Config, sqlDb *sql.DB) (*Server, error) {
 
 			results = append(results, row)
 		}
+
 		json.NewEncoder(w).Encode(&Response{
 			Items: results,
 		})
-	})
-
-	mux.HandleFunc("/api/{table}/{relation...}", func(w http.ResponseWriter, r *http.Request) {
-		// Handle tables with a 1-M relation
-		// When relation is accessed, fetch all results FK to the {table} for {relation...}
-		w.Write([]byte("Ok"))
 	})
 
 	srv := &http.Server{
