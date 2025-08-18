@@ -25,8 +25,9 @@ var serveCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 
 		cfg := &server.Config{
-			Port: viper.GetInt("server.port"),
-			Host: viper.GetString("server.host"),
+			Port:       viper.GetInt("server.port"),
+			Host:       viper.GetString("server.host"),
+			HandlerDir: "/home/jay/github/bodhi/examples",
 		}
 
 		sqlDb, err := db.New(fmt.Sprintf("%s?authToken=%s", viper.GetString("db.uri"), viper.GetString("db.token")))

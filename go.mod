@@ -5,6 +5,13 @@ go 1.22.0
 require github.com/spf13/cobra v1.8.0
 
 require (
+	github.com/dlclark/regexp2 v1.11.4 // indirect
+	github.com/go-sourcemap/sourcemap v2.1.3+incompatible // indirect
+	github.com/google/pprof v0.0.0-20230207041349-798e818bf904 // indirect
+	github.com/grafana/sobek v0.0.0-20250723111835-dd8a13f0d439 // indirect
+)
+
+require (
 	github.com/antlr4-go/antlr/v4 v4.13.0 // indirect
 	github.com/libsql/sqlite-antlr4-parser v0.0.0-20240327125255-dbf53b6cbf06 // indirect
 	github.com/tursodatabase/libsql-client-go v0.0.0-20240401075953-8e79a99d828a
