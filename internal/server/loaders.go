@@ -55,6 +55,8 @@ func (s *Server) loadFileHandlers(mux *http.ServeMux) error {
 			}
 		}
 
+		fmt.Printf("Registering js handler route: %-50s | %s\n", fmt.Sprintf("/%s", strings.Join(urlParts, "/")), path)
+
 		if len(urlParts) == 0 {
 			mux.HandleFunc("/{$}", s.wrapHandler(path))
 		} else {
@@ -68,7 +70,6 @@ func (s *Server) loadTables() error {
 	query, err := s.db.Query(tableQuery)
 
 	if err != nil {
-		query.Close()
 		return err
 	}
 
@@ -91,12 +92,10 @@ func (s *Server) loadTables() error {
 }
 
 func (s *Server) wrapHandler(path string) func(w http.ResponseWriter, r *http.Request) {
-
 	return func(w http.ResponseWriter, r *http.Request) {
 		// TODO cache vm + script instance instead of making one per request ?
 		vm := sobek.New()
 		addConsoleLog(vm)
-
 		jsContent, err := os.ReadFile(path)
 
 		if err != nil {
@@ -118,7 +117,7 @@ func (s *Server) wrapHandler(path string) func(w http.ResponseWriter, r *http.Re
 
 		sql, err := sqlFunc(sobek.Undefined())
 
-		if jsErr != nil {
+		if err != nil {
 			http.Error(w, fmt.Sprintf("sql function error: %v", err), http.StatusInternalServerError)
 			return
 		}

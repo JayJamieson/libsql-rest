@@ -17,6 +17,7 @@ import (
 
 var port int
 var host string
+var rootDir string
 
 var serveCmd = &cobra.Command{
 	Use:   "serve",
@@ -27,10 +28,11 @@ var serveCmd = &cobra.Command{
 		cfg := &server.Config{
 			Port:       viper.GetInt("server.port"),
 			Host:       viper.GetString("server.host"),
-			HandlerDir: "/home/jay/github/bodhi/examples",
+			HandlerDir: rootDir,
 		}
 
-		sqlDb, err := db.New(fmt.Sprintf("%s?authToken=%s", viper.GetString("db.uri"), viper.GetString("db.token")))
+		dsn := fmt.Sprintf("%s?authToken=%s", viper.GetString("db.uri"), viper.GetString("db.token"))
+		sqlDb, err := db.New(dsn)
 
 		if err != nil {
 			return err
@@ -69,6 +71,7 @@ func init() {
 		"host",
 		"",
 		"Port to start libsql-rest server on.")
+	serveCmd.Flags().StringVarP(&rootDir, "handlers", "d", "./app", "Directory containing javascript handlers.")
 
 	viper.BindPFlag("server.host", serveCmd.Flags().Lookup("host"))
 	viper.BindPFlag("server.port", serveCmd.Flags().Lookup("port"))

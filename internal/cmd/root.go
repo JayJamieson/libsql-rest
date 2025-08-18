@@ -36,9 +36,12 @@ func initConfig() {
 		// Find home directory.
 		home, err := os.UserHomeDir()
 		cobra.CheckErr(err)
+		pwd, err := os.Getwd()
 
+		cobra.CheckErr(err)
 		// Search config in home directory with name ".cobra" (without extension).
 		viper.AddConfigPath(home)
+		viper.AddConfigPath(pwd)
 		viper.SetConfigType("yaml")
 		viper.SetConfigName(".libsql-rest")
 	}

@@ -54,7 +54,7 @@ func New(cfg *Config, sqlDb *sql.DB) (*Server, error) {
 	}
 
 	mux.HandleFunc("GET /api/db/tables", app.listTables)
-	mux.HandleFunc("GET /api/{table}/{pk}", app.getRowByPK)
+	mux.HandleFunc("GET /api/db/{table}/{pk}", app.getRowByPK)
 	mux.HandleFunc("GET /api/db/{table}", app.listRows)
 
 	return app, nil
