@@ -1,172 +1,95 @@
+// Package server wires the HTTP layer: it builds a Store-backed Handler and
+// manages the http.Server lifecycle. HTTP concerns live here and in
+// handlers.go; data access lives behind the store.Store interface.
 package server
 
 import (
 	"context"
-	"database/sql"
-	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"time"
 
-	"github.com/JayJamieson/libsql-rest/internal/db"
+	"github.com/JayJamieson/libsql-rest/internal/store"
 )
 
+// Config holds HTTP server settings.
 type Config struct {
-	Port int
 	Host string
+	Port int
+	// AuthEnabled is surfaced in the generated OpenAPI spec.
+	AuthEnabled bool
 }
 
+// Server owns the HTTP server lifecycle.
 type Server struct {
-	cfg    *Config
+	cfg    Config
 	server *http.Server
-	db     *sql.DB
 }
 
-func New(cfg *Config, sqlDb *sql.DB) (*Server, error) {
-	mux := http.NewServeMux()
+// Middleware is a standard net/http middleware constructor.
+type Middleware func(http.Handler) http.Handler
 
-	mux.HandleFunc("GET /api/tables", func(w http.ResponseWriter, r *http.Request) {
-		query := "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view')"
+// New builds a Server that serves the API backed by the given store. The
+// supplied middlewares wrap the API routes in order (the first is outermost,
+// closest to the client); request logging always wraps everything.
+func New(cfg Config, s store.Store, middlewares ...Middleware) *Server {
+	handler := NewHandler(s, HandlerConfig{AuthEnabled: cfg.AuthEnabled})
 
-		if r.URL.Query().Has("order") {
-			ordering := r.URL.Query().Get("order")
-			query = fmt.Sprintf("%s ORDER BY `name` %s", query, ordering)
-		}
-
-		rows, err := sqlDb.QueryContext(r.Context(), query)
-
-		if err != nil {
-			rows.Close()
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		results := make([]map[string]interface{}, 0, db.MaxPageSize)
-		defer rows.Close()
-
-		for rows.Next() {
-			row := make(map[string]interface{})
-			errScan := db.MapScan(rows, row)
-
-			if errScan != nil {
-				log.Printf("%v", errScan)
-				http.Error(w, errScan.Error(), http.StatusInternalServerError)
-				return
-			}
-
-			results = append(results, row)
-		}
-
-		json.NewEncoder(w).Encode(&Response{
-			Items: results,
-		})
-	})
-
-	mux.HandleFunc("GET /api/{table}/{pk}", func(w http.ResponseWriter, r *http.Request) {
-		table := r.PathValue("table")
-		pk := r.PathValue("pk")
-
-		// TODO: Fix possible SQL injections #8
-		// introspect table to know what PK column to lookup and what type to cast to.
-		query := fmt.Sprintf("SELECT name, type FROM pragma_table_info('%s') WHERE pk = 1", table)
-		row := sqlDb.QueryRowContext(r.Context(), query)
-
-		var pkColumn string
-		var keyType string
-
-		err := row.Scan(&pkColumn, &keyType)
-
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		query = fmt.Sprintf("SELECT * FROM `%s` WHERE `%s` = ? LIMIT 1", table, pkColumn)
-		rowResult, err := sqlDb.QueryContext(r.Context(), query, pk)
-
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		result := make(map[string]interface{})
-
-		rowResult.Next()
-		errScan := db.MapScan(rowResult, result)
-
-		if errScan != nil {
-			http.Error(w, errScan.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		json.NewEncoder(w).Encode(&Response{
-			Items: result,
-		})
-
-	})
-
-	mux.HandleFunc("GET /api/{table}", func(w http.ResponseWriter, r *http.Request) {
-		// Think about how to add additional filtering capabilities similar to
-		// PostgREST https://postgrest.org/en/v12/references/api/tables_views.html#horizontal-filtering
-		// pRESTd https://docs.prestd.com/api-reference/advanced-queries
-
-		table := r.PathValue("table")
-
-		// TODO: Fix possible SQL injections #8
-		log.Printf("SELECT * FROM `%s`\n", table)
-		rows, err := sqlDb.QueryContext(r.Context(), fmt.Sprintf("SELECT * FROM `%s`", table))
-
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		results := make([]map[string]interface{}, 0, db.MaxPageSize)
-		defer rows.Close()
-
-		for rows.Next() {
-			row := make(map[string]interface{})
-			errScan := db.MapScan(rows, row)
-
-			if errScan != nil {
-				log.Printf("%v", errScan)
-				http.Error(w, errScan.Error(), http.StatusInternalServerError)
-				return
-			}
-
-			results = append(results, row)
-		}
-
-		json.NewEncoder(w).Encode(&Response{
-			Items: results,
-		})
-	})
+	var h http.Handler = handler.Routes()
+	// Apply in reverse so middlewares[0] ends up outermost.
+	for i := len(middlewares) - 1; i >= 0; i-- {
+		h = middlewares[i](h)
+	}
 
 	srv := &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
-		Handler:      mux,
+		Handler:      logRequests(h),
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
 
-	return &Server{
-		server: srv,
-		cfg:    cfg,
-		db:     sqlDb,
-	}, nil
+	return &Server{cfg: cfg, server: srv}
 }
 
+// Start begins serving and blocks until the server is shut down.
 func (srv *Server) Start() error {
-	log.Printf("Starting server on %s:%d", srv.cfg.Host, srv.cfg.Port)
+	slog.Info("starting server", "addr", srv.server.Addr)
 	err := srv.server.ListenAndServe()
-	if err != http.ErrServerClosed {
+	if err != nil && err != http.ErrServerClosed {
 		return err
 	}
 	return nil
 }
 
+// Shutdown gracefully stops the server.
 func (srv *Server) Shutdown(ctx context.Context) error {
-	log.Printf("Stopping server on %s:%d", srv.cfg.Host, srv.cfg.Port)
+	slog.Info("stopping server", "addr", srv.server.Addr)
 	return srv.server.Shutdown(ctx)
+}
+
+// logRequests is a minimal access-log middleware.
+func logRequests(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(sw, r)
+		slog.Info("request",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"status", sw.status,
+			"duration", time.Since(start).String(),
+		)
+	})
+}
+
+// statusWriter captures the response status code for logging.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
 }

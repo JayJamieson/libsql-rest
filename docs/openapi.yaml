@@ -1,0 +1,281 @@
+openapi: 3.0.3
+info:
+  title: libsql-rest
+  description: >
+    REST API exposing libSQL/Turso (or SQLite) tables and views, PostgREST-style.
+
+
+    The paths are generic: `{table}` is any exposed table or view and `{pk}` is a
+    row's primary key. Row bodies are open objects because their columns depend
+    on your database schema — see the note in the README on generating a
+    schema-aware spec with concrete per-table models.
+  version: 0.1.0
+  license:
+    name: MIT
+servers:
+  - url: http://localhost:8080
+    description: Local server
+
+# Applied globally, but only enforced when the server runs with auth enabled.
+security:
+  - bearerAuth: []
+
+paths:
+  /api/tables:
+    get:
+      operationId: listTables
+      summary: List exposed tables and views
+      tags: [schema]
+      responses:
+        "200":
+          description: The tables and views the API exposes
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Table"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/{table}:
+    parameters:
+      - $ref: "#/components/parameters/Table"
+    get:
+      operationId: listRows
+      summary: List rows from a table or view
+      description: >
+        Supports PostgREST-style horizontal filtering. Besides the reserved
+        parameters below, any `column=op.value` pair filters rows, where `op` is
+        one of eq, neq, gt, gte, lt, lte, like, ilike, in, is (prefix with `not.`
+        to negate). Example: `?age=gte.18&name=like.jo*&status=not.eq.archived`.
+      tags: [rows]
+      parameters:
+        - $ref: "#/components/parameters/Select"
+        - $ref: "#/components/parameters/Order"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+        - name: filters
+          in: query
+          required: false
+          description: >
+            Dynamic per-column filters expressed as `column=op.value`. Modeled as
+            a free-form map so generated clients can pass arbitrary column filters.
+          style: form
+          explode: true
+          schema:
+            type: object
+            additionalProperties:
+              type: string
+      responses:
+        "200":
+          description: Matching rows
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Row"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/ServerError"
+    post:
+      operationId: createRow
+      summary: Create a row
+      tags: [rows]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Row"
+      responses:
+        "201":
+          description: The created row, including database-assigned defaults
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Row"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/{table}/{pk}:
+    parameters:
+      - $ref: "#/components/parameters/Table"
+      - $ref: "#/components/parameters/Pk"
+    get:
+      operationId: getRow
+      summary: Fetch a single row by primary key
+      tags: [rows]
+      responses:
+        "200":
+          description: The row
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Row"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/ServerError"
+    patch:
+      operationId: updateRow
+      summary: Update a row by primary key
+      tags: [rows]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Row"
+      responses:
+        "200":
+          description: The updated row
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Row"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/ServerError"
+    delete:
+      operationId: deleteRow
+      summary: Delete a row by primary key
+      tags: [rows]
+      responses:
+        "204":
+          description: The row was deleted
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        JWT bearer token. Required on every endpoint when the server runs with
+        authentication enabled; ignored when it does not.
+
+  parameters:
+    Table:
+      name: table
+      in: path
+      required: true
+      description: Name of an exposed table or view
+      schema:
+        type: string
+    Pk:
+      name: pk
+      in: path
+      required: true
+      description: Primary key value of the row
+      schema:
+        type: string
+    Select:
+      name: select
+      in: query
+      required: false
+      description: Comma-separated list of columns to return (projection)
+      schema:
+        type: string
+      example: id,name
+    Order:
+      name: order
+      in: query
+      required: false
+      description: >
+        Comma-separated ordering terms as `column[.asc|.desc][.nullsfirst|.nullslast]`.
+      schema:
+        type: string
+      example: age.desc,name.asc
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Maximum rows to return (capped by the server's max_page_size)
+      schema:
+        type: integer
+        minimum: 0
+    Offset:
+      name: offset
+      in: query
+      required: false
+      description: Number of rows to skip
+      schema:
+        type: integer
+        minimum: 0
+
+  schemas:
+    Table:
+      type: object
+      properties:
+        name:
+          type: string
+        type:
+          type: string
+          enum: [table, view]
+      required: [name, type]
+    Row:
+      type: object
+      description: >
+        A database row. Properties are dynamic (they depend on the table's
+        columns), so this is an open object.
+      additionalProperties: true
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+      required: [error]
+
+  responses:
+    BadRequest:
+      description: Invalid request (unknown column, bad operator, malformed body)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing or invalid authentication token
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Table/view or row not found (also returned for disallowed tables)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ServerError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
