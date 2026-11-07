@@ -1,46 +1,71 @@
-// Package schema introspects a SQLite-compatible database so the rest of the
-// application can validate table and column identifiers against the real
-// schema. Validating identifiers this way is what lets the query layer safely
-// interpolate them into SQL (values are always bound as parameters).
+// Package schema reads table and column metadata from a SQLite-compatible database.
 package schema
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"sync"
 )
 
-// Column describes a single column of a table or view.
+var ErrTableNotFound = errors.New("table not found")
+
 type Column struct {
 	Name         string
 	Type         string
 	NotNull      bool
 	DefaultValue sql.NullString
-	// PKIndex is the 1-based position of the column within the primary key,
-	// or 0 if the column is not part of the primary key.
-	PKIndex int
+	PKIndex      int
 }
 
-// IsPrimaryKey reports whether the column is part of the primary key.
 func (c Column) IsPrimaryKey() bool { return c.PKIndex > 0 }
 
-// Nullable reports whether the column may hold NULL. Primary-key columns are
-// treated as non-nullable regardless of the NOT NULL flag: pragma_table_info
-// reports notnull=0 for an INTEGER PRIMARY KEY (a rowid alias) even though it
-// can never be null, and a null primary key is meaningless for the API.
+type Affinity int
+
+const (
+	AffinityBlob Affinity = iota
+	AffinityText
+	AffinityNumeric
+	AffinityInteger
+	AffinityReal
+)
+
+// Affinity applies SQLite's rules to the declared type, in SQLite's order:
+// https://www.sqlite.org/datatype3.html#determination_of_column_affinity
+func (c Column) Affinity() Affinity {
+	t := strings.ToUpper(c.Type)
+	switch {
+	case strings.Contains(t, "INT"):
+		return AffinityInteger
+	case strings.Contains(t, "CHAR"), strings.Contains(t, "CLOB"), strings.Contains(t, "TEXT"):
+		return AffinityText
+	case t == "", strings.Contains(t, "BLOB"):
+		return AffinityBlob
+	case strings.Contains(t, "REAL"), strings.Contains(t, "FLOA"), strings.Contains(t, "DOUB"):
+		return AffinityReal
+	default:
+		return AffinityNumeric
+	}
+}
+
+// Nullable treats primary key columns as non-null. pragma_table_info reports
+// notnull=0 for an INTEGER PRIMARY KEY even though it can never hold NULL.
 func (c Column) Nullable() bool {
 	return !c.NotNull && !c.IsPrimaryKey()
 }
 
-// Table describes a table or view and its columns.
 type Table struct {
 	Name    string
-	Type    string // "table" or "view"
+	Type    string
 	Columns []Column
 }
 
-// ColumnNames returns the column names in declaration order.
+func (t *Table) IsView() bool { return t.Type == "view" }
+
 func (t *Table) ColumnNames() []string {
 	names := make([]string, len(t.Columns))
 	for i, c := range t.Columns {
@@ -49,74 +74,58 @@ func (t *Table) ColumnNames() []string {
 	return names
 }
 
-// HasColumn reports whether the table has a column with the given name.
-func (t *Table) HasColumn(name string) bool {
-	for _, c := range t.Columns {
-		if c.Name == name {
-			return true
-		}
+func (t *Table) Column(name string) (Column, bool) {
+	i := slices.IndexFunc(t.Columns, func(c Column) bool { return c.Name == name })
+	if i < 0 {
+		return Column{}, false
 	}
-	return false
+	return t.Columns[i], true
 }
 
-// PrimaryKey returns the primary key columns in key order. For an ordinary
-// SQLite table without an explicit primary key this is empty; callers should
-// fall back to "rowid" in that case.
+func (t *Table) HasColumn(name string) bool {
+	_, ok := t.Column(name)
+	return ok
+}
+
 func (t *Table) PrimaryKey() []Column {
 	var pk []Column
 	for _, c := range t.Columns {
-		if c.PKIndex > 0 {
+		if c.IsPrimaryKey() {
 			pk = append(pk, c)
 		}
 	}
-	// pragma_table_info already reports columns ordered, but sort defensively
-	// by PKIndex to guarantee key order for composite keys.
-	for i := 1; i < len(pk); i++ {
-		for j := i; j > 0 && pk[j-1].PKIndex > pk[j].PKIndex; j-- {
-			pk[j-1], pk[j] = pk[j], pk[j-1]
-		}
-	}
+	slices.SortFunc(pk, func(a, b Column) int { return cmp.Compare(a.PKIndex, b.PKIndex) })
 	return pk
 }
 
-// Introspector exposes read-only schema metadata.
+// RowKey returns the primary key column when the key is a single column.
+// Views report no primary key, so they have no row key either.
+func (t *Table) RowKey() (Column, bool) {
+	pk := t.PrimaryKey()
+	if len(pk) != 1 {
+		return Column{}, false
+	}
+	return pk[0], true
+}
+
 type Introspector interface {
-	// Tables lists the tables and views the database exposes.
 	Tables(ctx context.Context) ([]Table, error)
-	// Table returns metadata for a single table or view. It returns
-	// ErrTableNotFound if the name does not exist.
 	Table(ctx context.Context, name string) (*Table, error)
 }
 
-// ErrTableNotFound is returned when a requested table or view does not exist.
-var ErrTableNotFound = fmt.Errorf("table not found")
-
-// Querier is the subset of *sql.DB the introspector needs, which keeps it
-// testable and usable within a transaction.
 type Querier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
-// SQLIntrospector introspects a SQLite-compatible database and caches results.
-// The schema is assumed to be stable for the lifetime of the process; call
-// Refresh to invalidate the cache after DDL changes.
 type SQLIntrospector struct {
 	db Querier
 
 	mu     sync.RWMutex
-	tables map[string]*Table // keyed by table name; nil until first load
+	tables map[string]*Table
 }
 
-// NewSQLIntrospector constructs an introspector over the given database handle.
 func NewSQLIntrospector(db Querier) *SQLIntrospector {
 	return &SQLIntrospector{db: db}
-}
-
-// Refresh clears the cached schema so the next lookup re-reads the database.
-func (s *SQLIntrospector) Refresh() {
-	s.mu.Lock()
-	s.tables = nil
-	s.mu.Unlock()
 }
 
 func (s *SQLIntrospector) Tables(ctx context.Context) ([]Table, error) {
@@ -128,14 +137,9 @@ func (s *SQLIntrospector) Tables(ctx context.Context) ([]Table, error) {
 
 	out := make([]Table, 0, len(s.tables))
 	for _, t := range s.tables {
-		out = append(out, *t)
+		out = append(out, t.clone())
 	}
-	// Stable, name-ordered output.
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && out[j-1].Name > out[j].Name; j-- {
-			out[j-1], out[j] = out[j], out[j-1]
-		}
-	}
+	slices.SortFunc(out, func(a, b Table) int { return cmp.Compare(a.Name, b.Name) })
 	return out, nil
 }
 
@@ -149,10 +153,14 @@ func (s *SQLIntrospector) Table(ctx context.Context, name string) (*Table, error
 	if !ok {
 		return nil, fmt.Errorf("%q: %w", name, ErrTableNotFound)
 	}
-	// Return a copy so callers cannot mutate the cache.
-	cp := *t
-	cp.Columns = append([]Column(nil), t.Columns...)
-	return &cp, nil
+	c := t.clone()
+	return &c, nil
+}
+
+func (t *Table) clone() Table {
+	c := *t
+	c.Columns = slices.Clone(t.Columns)
+	return c
 }
 
 func (s *SQLIntrospector) ensureLoaded(ctx context.Context) error {
@@ -165,7 +173,7 @@ func (s *SQLIntrospector) ensureLoaded(ctx context.Context) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.tables != nil { // another goroutine loaded while we waited
+	if s.tables != nil {
 		return nil
 	}
 
@@ -173,27 +181,25 @@ func (s *SQLIntrospector) ensureLoaded(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-
-	loadedTables := make(map[string]*Table, len(tables))
+	byName := make(map[string]*Table, len(tables))
 	for i := range tables {
 		cols, err := s.loadColumns(ctx, tables[i].Name)
 		if err != nil {
 			return err
 		}
 		tables[i].Columns = cols
-		loadedTables[tables[i].Name] = &tables[i]
+		byName[tables[i].Name] = &tables[i]
 	}
-	s.tables = loadedTables
+	s.tables = byName
 	return nil
 }
 
 func (s *SQLIntrospector) loadTables(ctx context.Context) ([]Table, error) {
 	const q = `SELECT name, type FROM sqlite_master
-		WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'
-		ORDER BY name`
+		WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%'`
 	rows, err := s.db.QueryContext(ctx, q)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("listing tables: %w", err)
 	}
 	defer rows.Close()
 
@@ -209,24 +215,18 @@ func (s *SQLIntrospector) loadTables(ctx context.Context) ([]Table, error) {
 }
 
 func (s *SQLIntrospector) loadColumns(ctx context.Context, table string) ([]Column, error) {
-	// pragma_table_info is a table-valued function; the table name is bound as
-	// a parameter so this introspection query is itself injection-safe.
 	rows, err := s.db.QueryContext(ctx, `SELECT name, type, "notnull", dflt_value, pk FROM pragma_table_info(?)`, table)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("reading columns of %q: %w", table, err)
 	}
 	defer rows.Close()
 
 	var cols []Column
 	for rows.Next() {
-		var (
-			c       Column
-			notNull int
-		)
-		if err := rows.Scan(&c.Name, &c.Type, &notNull, &c.DefaultValue, &c.PKIndex); err != nil {
+		var c Column
+		if err := rows.Scan(&c.Name, &c.Type, &c.NotNull, &c.DefaultValue, &c.PKIndex); err != nil {
 			return nil, err
 		}
-		c.NotNull = notNull != 0
 		cols = append(cols, c)
 	}
 	return cols, rows.Err()

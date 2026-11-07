@@ -17,9 +17,18 @@ func TestValidateDefaults(t *testing.T) {
 
 func TestValidateErrors(t *testing.T) {
 	cases := map[string]func(*Config){
-		"bad driver": func(c *Config) { c.DB.Driver = "postgres" },
-		"empty uri":  func(c *Config) { c.DB.URI = "" },
-		"bad port":   func(c *Config) { c.Server.Port = 0 },
+		"bad driver":          func(c *Config) { c.DB.Driver = "postgres" },
+		"empty uri":           func(c *Config) { c.DB.URI = "" },
+		"bad port":            func(c *Config) { c.Server.Port = 0 },
+		"empty driver":        func(c *Config) { c.DB.Driver = "" },
+		"zero page size":      func(c *Config) { c.MaxPageSize = 0 },
+		"auth without secret": func(c *Config) { c.Auth.Enabled = true },
+		"rsa without key": func(c *Config) {
+			c.Auth.Enabled, c.Auth.Algorithm = true, "RS256"
+		},
+		"auth without issuer": func(c *Config) {
+			c.Auth.Enabled, c.Auth.Secret, c.Auth.Issuer = true, "s", ""
+		},
 	}
 	for name, mutate := range cases {
 		c := Default()

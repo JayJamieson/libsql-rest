@@ -13,33 +13,18 @@ import (
 	"github.com/auth0/go-jwt-middleware/v2/validator"
 )
 
-// Middleware is a standard net/http middleware constructor.
-type Middleware func(http.Handler) http.Handler
-
-// JWTOptions configures the JWT middleware. It supports HMAC (HS256/384/512)
-// with a shared secret and RSA (RS256/384/512) with a public key. RSA is the
-// recommended production mode: the server holds only the public key and can
-// verify tokens signed elsewhere without being able to mint them.
 type JWTOptions struct {
-	// Algorithm is the expected signing algorithm (default HS256).
-	Algorithm string
-	// HMACSecret is the shared signing key for HS* algorithms.
-	HMACSecret []byte
-	// RSAPublicKey is the verification key for RS* algorithms.
-	RSAPublicKey *rsa.PublicKey
-	// Issuer and Audience are validated against the token's `iss` and `aud`.
-	Issuer   string
-	Audience []string
-	// CredentialsOptional lets unauthenticated requests through as anonymous
-	// instead of being rejected with 401. This is the toggle row-level security
-	// will use so per-table rules — not the middleware — decide access.
+	Algorithm           string
+	HMACSecret          []byte
+	RSAPublicKey        *rsa.PublicKey
+	Issuer              string
+	Audience            []string
 	CredentialsOptional bool
 }
 
-// supportedAlgorithms maps algorithm names to the validator's type. Pinning the
-// expected algorithm here is also a security control: a token whose header
-// advertises a different algorithm is rejected, preventing algorithm-confusion
-// attacks (e.g. an RS256 public key being abused as an HS256 secret).
+// The validator rejects any token whose header names a different algorithm
+// from the configured one. That stops an attacker from signing an HS256 token
+// with the server's RSA public key as the secret.
 var supportedAlgorithms = map[string]validator.SignatureAlgorithm{
 	"HS256": validator.HS256,
 	"HS384": validator.HS384,
@@ -49,14 +34,8 @@ var supportedAlgorithms = map[string]validator.SignatureAlgorithm{
 	"RS512": validator.RS512,
 }
 
-// NewJWTMiddleware builds middleware that validates a bearer JWT and attaches
-// the resulting Principal to the request context. On validation failure it
-// responds 401 with the API's standard JSON error envelope.
-func NewJWTMiddleware(opts JWTOptions) (Middleware, error) {
+func NewJWTMiddleware(opts JWTOptions) (func(http.Handler) http.Handler, error) {
 	alg := strings.ToUpper(opts.Algorithm)
-	if alg == "" {
-		alg = "HS256"
-	}
 	sigAlg, ok := supportedAlgorithms[alg]
 	if !ok {
 		return nil, fmt.Errorf("unsupported jwt algorithm %q (supported: HS256/384/512, RS256/384/512)", opts.Algorithm)
@@ -85,14 +64,10 @@ func NewJWTMiddleware(opts JWTOptions) (Middleware, error) {
 	)
 
 	return func(next http.Handler) http.Handler {
-		// CheckJWT validates and stores its own claims in the context; the
-		// adapter translates those into our Principal for downstream use.
 		return mw.CheckJWT(principalAdapter(next))
 	}, nil
 }
 
-// keyFuncFor returns the verification-key function for the given algorithm,
-// validating that the matching key material was supplied.
 func keyFuncFor(alg string, opts JWTOptions) (func(context.Context) (any, error), error) {
 	switch {
 	case strings.HasPrefix(alg, "HS"):
@@ -112,8 +87,6 @@ func keyFuncFor(alg string, opts JWTOptions) (func(context.Context) (any, error)
 	}
 }
 
-// principalAdapter reads the library's validated claims from the context,
-// converts them into a Principal, and stores that Principal for handlers/store.
 func principalAdapter(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		principal := Anonymous()
@@ -132,8 +105,6 @@ func principalFromClaims(claims *validator.ValidatedClaims) *Principal {
 	return p
 }
 
-// errorHandler renders JWT failures using the same envelope as the rest of the
-// API ({"error": "..."}) with a 401 status.
 func errorHandler(w http.ResponseWriter, _ *http.Request, err error) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusUnauthorized)
@@ -144,16 +115,18 @@ func errorHandler(w http.ResponseWriter, _ *http.Request, err error) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
-// mapClaims captures the full JWT payload as a map so authorization rules can
-// reference any claim. jose deserializes the payload JSON into this type via
-// UnmarshalJSON.
 type mapClaims struct {
 	fields map[string]any
 }
 
-// Validate satisfies validator.CustomClaims; per-claim checks are deferred to
-// the authorization layer.
-func (c *mapClaims) Validate(context.Context) error { return nil }
+// Validate requires exp. go-jwt-middleware checks exp only when a token has
+// one, so a token without it would never expire.
+func (c *mapClaims) Validate(context.Context) error {
+	if _, ok := c.fields["exp"]; !ok {
+		return errors.New("token has no exp claim")
+	}
+	return nil
+}
 
 func (c *mapClaims) UnmarshalJSON(b []byte) error {
 	return json.Unmarshal(b, &c.fields)

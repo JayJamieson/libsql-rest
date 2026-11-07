@@ -11,36 +11,40 @@ import (
 	"github.com/JayJamieson/libsql-rest/internal/store"
 )
 
-// errorBody is the JSON envelope returned for error responses.
 type errorBody struct {
 	Error string `json:"error"`
 }
 
-// writeJSON serializes v as JSON with the given status code.
+var clientErrors = []struct {
+	err    error
+	status int
+}{
+	{schema.ErrTableNotFound, http.StatusNotFound},
+	{store.ErrRowNotFound, http.StatusNotFound},
+	{query.ErrInvalidRequest, http.StatusBadRequest},
+	{store.ErrNoRowKey, http.StatusBadRequest},
+	{store.ErrReadOnly, http.StatusBadRequest},
+	{store.ErrConstraint, http.StatusBadRequest},
+	{store.ErrConflict, http.StatusConflict},
+	{errInvalidBody, http.StatusBadRequest},
+	{errBodyTooLarge, http.StatusRequestEntityTooLarge},
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(v); err != nil {
-		slog.Error("failed to encode response", "err", err)
+		slog.Error("encoding response", "err", err)
 	}
 }
 
-// writeError writes a JSON error envelope with the given status code.
-func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, errorBody{Error: msg})
-}
-
-// writeStoreError maps a store/query error to an appropriate HTTP status and
-// JSON body. Client-caused errors surface their message; unexpected errors are
-// logged and reported generically so internals are not leaked.
-func writeStoreError(w http.ResponseWriter, err error) {
-	switch {
-	case errors.Is(err, schema.ErrTableNotFound), errors.Is(err, store.ErrRowNotFound):
-		writeError(w, http.StatusNotFound, err.Error())
-	case errors.Is(err, query.ErrInvalidRequest), errors.Is(err, store.ErrCompositePrimaryKey):
-		writeError(w, http.StatusBadRequest, err.Error())
-	default:
-		slog.Error("internal server error", "err", err)
-		writeError(w, http.StatusInternalServerError, "internal server error")
+func writeError(w http.ResponseWriter, err error) {
+	for _, e := range clientErrors {
+		if errors.Is(err, e.err) {
+			writeJSON(w, e.status, errorBody{Error: err.Error()})
+			return
+		}
 	}
+	slog.Error("internal server error", "err", err)
+	writeJSON(w, http.StatusInternalServerError, errorBody{Error: "internal server error"})
 }

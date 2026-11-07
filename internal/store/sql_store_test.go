@@ -1,10 +1,9 @@
 package store_test
 
 import (
-	"context"
 	"database/sql"
 	"errors"
-	"net/url"
+	"fmt"
 	"testing"
 
 	"github.com/JayJamieson/libsql-rest/internal/query"
@@ -25,6 +24,8 @@ func newStore(t *testing.T, opts store.Options) (*store.SQLStore, *sql.DB) {
 		`CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)`,
 		`INSERT INTO users (id, name, age) VALUES (1, 'ada', 36), (2, 'linus', 54), (3, 'grace', 85)`,
 		`CREATE TABLE secret (id INTEGER PRIMARY KEY, val TEXT)`,
+		`CREATE TABLE pairs (a TEXT, b TEXT, PRIMARY KEY (a, b))`,
+		`CREATE VIEW adults AS SELECT * FROM users WHERE age >= 18`,
 	}
 	for _, s := range seed {
 		if _, err := db.Exec(s); err != nil {
@@ -37,11 +38,7 @@ func newStore(t *testing.T, opts store.Options) (*store.SQLStore, *sql.DB) {
 
 func listReq(t *testing.T, raw string) query.ListRequest {
 	t.Helper()
-	v, err := url.ParseQuery(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req, err := query.ParseListRequest(v)
+	req, err := query.ParseListRequest(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +47,7 @@ func listReq(t *testing.T, raw string) query.ListRequest {
 
 func TestList(t *testing.T) {
 	s, _ := newStore(t, store.Options{})
-	rows, err := s.List(context.Background(), "users", listReq(t, "age=gte.50&order=age.asc"))
+	rows, err := s.List(t.Context(), "users", listReq(t, "age=gte.50&order=age.asc"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +61,7 @@ func TestList(t *testing.T) {
 
 func TestGet(t *testing.T) {
 	s, _ := newStore(t, store.Options{})
-	row, err := s.Get(context.Background(), "users", "1")
+	row, err := s.Get(t.Context(), "users", "1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,14 +69,14 @@ func TestGet(t *testing.T) {
 		t.Errorf("row = %v", row)
 	}
 
-	_, err = s.Get(context.Background(), "users", "999")
+	_, err = s.Get(t.Context(), "users", "999")
 	if !errors.Is(err, store.ErrRowNotFound) {
 		t.Errorf("missing row err = %v, want ErrRowNotFound", err)
 	}
 }
 
 func TestInsertUpdateDelete(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	s, _ := newStore(t, store.Options{})
 
 	created, err := s.Insert(ctx, "users", store.Row{"name": "hopper", "age": 85})
@@ -90,13 +87,13 @@ func TestInsertUpdateDelete(t *testing.T) {
 	if !ok {
 		t.Fatalf("insert did not return id: %v", created)
 	}
-	pk := toStr(id)
+	pk := fmt.Sprint(id)
 
 	updated, err := s.Update(ctx, "users", pk, store.Row{"age": 86})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if toStr(updated["age"]) != "86" {
+	if updated["age"] != int64(86) {
 		t.Errorf("update age = %v", updated["age"])
 	}
 
@@ -106,7 +103,6 @@ func TestInsertUpdateDelete(t *testing.T) {
 	if _, err := s.Get(ctx, "users", pk); !errors.Is(err, store.ErrRowNotFound) {
 		t.Errorf("row not deleted, err = %v", err)
 	}
-	// Deleting again is a not-found.
 	if err := s.Delete(ctx, "users", pk); !errors.Is(err, store.ErrRowNotFound) {
 		t.Errorf("second delete err = %v, want ErrRowNotFound", err)
 	}
@@ -114,7 +110,7 @@ func TestInsertUpdateDelete(t *testing.T) {
 
 func TestUpdateMissingRow(t *testing.T) {
 	s, _ := newStore(t, store.Options{})
-	_, err := s.Update(context.Background(), "users", "999", store.Row{"age": 1})
+	_, err := s.Update(t.Context(), "users", "999", store.Row{"age": 1})
 	if !errors.Is(err, store.ErrRowNotFound) {
 		t.Errorf("err = %v, want ErrRowNotFound", err)
 	}
@@ -124,51 +120,39 @@ func TestAllowList(t *testing.T) {
 	allow := func(name string) bool { return name == "users" }
 	s, _ := newStore(t, store.Options{Allow: allow})
 
-	// Disallowed table is reported as not-found, not leaked.
-	if _, err := s.List(context.Background(), "secret", query.ListRequest{}); !errors.Is(err, schema.ErrTableNotFound) {
+	if _, err := s.List(t.Context(), "secret", query.ListRequest{}); !errors.Is(err, schema.ErrTableNotFound) {
 		t.Errorf("disallowed list err = %v", err)
 	}
 
-	tables, err := s.Tables(context.Background())
+	tables, err := s.Tables(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, tb := range tables {
-		if tb["name"] == "secret" {
-			t.Errorf("allow-list leaked 'secret': %v", tables)
+		if tb.Name == "secret" {
+			t.Errorf("allow list leaked secret: %v", tables)
 		}
 	}
 }
 
-func toStr(v any) string {
-	switch n := v.(type) {
-	case int64:
-		return itoa(n)
-	case string:
-		return n
-	default:
-		return ""
+func TestKeyedAccessNeedsSingleKey(t *testing.T) {
+	s, _ := newStore(t, store.Options{})
+	for _, table := range []string{"adults", "pairs"} {
+		if _, err := s.Get(t.Context(), table, "1"); !errors.Is(err, store.ErrNoRowKey) {
+			t.Errorf("Get(%s) err = %v, want ErrNoRowKey", table, err)
+		}
+		if _, err := s.Update(t.Context(), table, "1", store.Row{"a": "x"}); !errors.Is(err, store.ErrNoRowKey) {
+			t.Errorf("Update(%s) err = %v, want ErrNoRowKey", table, err)
+		}
+		if err := s.Delete(t.Context(), table, "1"); !errors.Is(err, store.ErrNoRowKey) {
+			t.Errorf("Delete(%s) err = %v, want ErrNoRowKey", table, err)
+		}
 	}
 }
 
-func itoa(n int64) string {
-	if n == 0 {
-		return "0"
+func TestInsertIntoViewIsReadOnly(t *testing.T) {
+	s, _ := newStore(t, store.Options{})
+	if _, err := s.Insert(t.Context(), "adults", store.Row{"name": "x"}); !errors.Is(err, store.ErrReadOnly) {
+		t.Errorf("err = %v, want ErrReadOnly", err)
 	}
-	neg := n < 0
-	if neg {
-		n = -n
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	if neg {
-		i--
-		buf[i] = '-'
-	}
-	return string(buf[i:])
 }

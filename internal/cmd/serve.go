@@ -2,10 +2,15 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,21 +21,137 @@ import (
 	"github.com/JayJamieson/libsql-rest/internal/server"
 	"github.com/JayJamieson/libsql-rest/internal/store"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 )
 
-var serveCmd = &cobra.Command{
-	Use:   "serve",
-	Short: "start a libsql-rest server",
-	Long:  `start a libsql-rest server exposing your tables as a REST API`,
-	RunE:  runServe,
+var configFlags = map[string]string{
+	"server.host":          "host",
+	"server.port":          "port",
+	"server.max_page_size": "max-page-size",
+	"allow_tables":         "allow-tables",
+	"db.driver":            "driver",
+	"db.uri":               "uri",
+	"db.token":             "token",
+	"auth.enabled":         "auth",
+	"auth.algorithm":       "auth-algorithm",
+	"auth.secret":          "auth-secret",
+	"auth.public_key_path": "auth-public-key",
+	"auth.issuer":          "auth-issuer",
+	"auth.audience":        "auth-audience",
+	"auth.optional":        "auth-optional",
 }
 
-func runServe(cmd *cobra.Command, args []string) error {
-	cfg := loadConfig()
-	if err := cfg.Validate(); err != nil {
-		return err
+func newServeCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "serve",
+		Short: "Start the HTTP server",
+		Long: `Start the HTTP server.
+
+Settings come from flags, then LIBSQL_REST_* environment variables, then the
+config file, then the defaults shown below.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, err := loadConfig(cmd.Flags())
+			if err != nil {
+				return err
+			}
+			return serve(cmd.Context(), cfg, cmd.Root().Version)
+		},
 	}
+
+	d := config.Default()
+	f := cmd.Flags()
+	f.String("config", "", "config file (default $HOME/.libsql-rest.yaml)")
+	f.String("host", d.Server.Host, "interface to bind; empty binds all interfaces")
+	f.IntP("port", "p", d.Server.Port, "port to listen on")
+	f.Int("max-page-size", d.MaxPageSize, "default and maximum rows per list request")
+	f.StringSlice("allow-tables", nil, "tables and views to expose; empty exposes all")
+	f.String("driver", string(d.DB.Driver), "database driver: sqlite or libsql")
+	f.String("uri", d.DB.URI, "database URI")
+	f.String("token", "", "libsql auth token")
+	f.Bool("auth", false, "require a JWT bearer token on API requests")
+	f.String("auth-algorithm", d.Auth.Algorithm, "JWT algorithm: HS256, HS384, HS512, RS256, RS384, or RS512")
+	f.String("auth-secret", "", "HMAC secret for HS* algorithms")
+	f.String("auth-public-key", "", "PEM file with the RSA public key for RS* algorithms")
+	f.String("auth-issuer", d.Auth.Issuer, "required iss claim")
+	f.String("auth-audience", d.Auth.Audience, "required aud claim")
+	f.Bool("auth-optional", false, "let requests without a token through as anonymous")
+	return cmd
+}
+
+func loadConfig(flags *pflag.FlagSet) (config.Config, error) {
+	v := viper.New()
+	for key, name := range configFlags {
+		if err := v.BindPFlag(key, flags.Lookup(name)); err != nil {
+			return config.Config{}, fmt.Errorf("binding --%s: %w", name, err)
+		}
+	}
+	v.SetEnvPrefix("libsql_rest")
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	v.AutomaticEnv()
+
+	if file := flags.Lookup("config").Value.String(); file != "" {
+		v.SetConfigFile(file)
+	} else if home, err := os.UserHomeDir(); err == nil {
+		v.AddConfigPath(home)
+		v.SetConfigName(".libsql-rest")
+		v.SetConfigType("yaml")
+	}
+	if err := v.ReadInConfig(); err != nil {
+		var notFound viper.ConfigFileNotFoundError
+		if !errors.As(err, &notFound) {
+			return config.Config{}, fmt.Errorf("reading config file: %w", err)
+		}
+	} else {
+		slog.Info("loaded config file", "path", v.ConfigFileUsed())
+	}
+
+	cfg := config.Config{
+		Server: config.ServerConfig{
+			Host: v.GetString("server.host"),
+			Port: v.GetInt("server.port"),
+		},
+		DB: config.DBConfig{
+			Driver: config.Driver(v.GetString("db.driver")),
+			URI:    v.GetString("db.uri"),
+			Token:  v.GetString("db.token"),
+		},
+		Auth: config.AuthConfig{
+			Enabled:       v.GetBool("auth.enabled"),
+			Algorithm:     v.GetString("auth.algorithm"),
+			Secret:        v.GetString("auth.secret"),
+			PublicKeyPath: v.GetString("auth.public_key_path"),
+			Issuer:        v.GetString("auth.issuer"),
+			Audience:      v.GetString("auth.audience"),
+			Optional:      v.GetBool("auth.optional"),
+		},
+		MaxPageSize: v.GetInt("server.max_page_size"),
+		AllowTables: splitNames(v.GetStringSlice("allow_tables")),
+	}
+	if err := cfg.Validate(); err != nil {
+		return config.Config{}, err
+	}
+	return cfg, nil
+}
+
+// splitNames also splits on commas. Viper splits an environment variable on
+// spaces only, so LIBSQL_REST_ALLOW_TABLES=users,posts would be one name.
+func splitNames(items []string) []string {
+	var names []string
+	for _, item := range items {
+		for name := range strings.SplitSeq(item, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				names = append(names, name)
+			}
+		}
+	}
+	return names
+}
+
+func serve(ctx context.Context, cfg config.Config, version string) error {
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	sqlDB, err := db.Open(cfg.DB)
 	if err != nil {
@@ -38,137 +159,68 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	defer sqlDB.Close()
 
-	// Verify connectivity early so misconfiguration fails fast rather than on
-	// the first request.
-	pingCtx, cancelPing := context.WithTimeout(cmd.Context(), 5*time.Second)
+	pingCtx, cancelPing := context.WithTimeout(ctx, 5*time.Second)
 	defer cancelPing()
 	if err := sqlDB.PingContext(pingCtx); err != nil {
-		return err
+		return fmt.Errorf("connecting to database: %w", err)
 	}
 
-	introspector := schema.NewSQLIntrospector(sqlDB)
-	dataStore := store.NewSQLStore(sqlDB, introspector, store.Options{
+	st := store.NewSQLStore(sqlDB, schema.NewSQLIntrospector(sqlDB), store.Options{
 		MaxPageSize: cfg.MaxPageSize,
 		Allow:       cfg.IsTableAllowed,
 	})
-
-	var middlewares []server.Middleware
+	h := server.NewHandler(st, server.HandlerConfig{
+		TokenRequired: cfg.Auth.Enabled && !cfg.Auth.Optional,
+		Version:       version,
+	}).Routes()
 	if cfg.Auth.Enabled {
-		opts := auth.JWTOptions{
-			Algorithm:           cfg.Auth.Algorithm,
-			Issuer:              cfg.Auth.Issuer,
-			Audience:            []string{cfg.Auth.Audience},
-			CredentialsOptional: cfg.Auth.Optional,
-		}
-		if cfg.Auth.IsRSA() {
-			pemBytes, err := os.ReadFile(cfg.Auth.PublicKeyPath)
-			if err != nil {
-				return fmt.Errorf("reading auth public key: %w", err)
-			}
-			pub, err := auth.ParseRSAPublicKey(pemBytes)
-			if err != nil {
-				return err
-			}
-			opts.RSAPublicKey = pub
-		} else {
-			opts.HMACSecret = []byte(cfg.Auth.Secret)
-		}
-
-		authMW, err := auth.NewJWTMiddleware(opts)
+		requireToken, err := authMiddleware(cfg.Auth)
 		if err != nil {
 			return err
 		}
-		middlewares = append(middlewares, server.Middleware(authMW))
+		h = requireToken(h)
 		slog.Info("jwt authentication enabled", "algorithm", cfg.Auth.Algorithm, "issuer", cfg.Auth.Issuer, "optional", cfg.Auth.Optional)
 	}
 
-	srv := server.New(server.Config{
-		Host:        cfg.Server.Host,
-		Port:        cfg.Server.Port,
-		AuthEnabled: cfg.Auth.Enabled,
-	}, dataStore, middlewares...)
-
-	done := make(chan os.Signal, 1)
-	signal.Notify(done, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+	srv := server.New(net.JoinHostPort(cfg.Server.Host, strconv.Itoa(cfg.Server.Port)), h)
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		return err
+	}
+	slog.Info("listening", "addr", ln.Addr().String(), "version", version)
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- srv.Start() }()
+	go func() { errCh <- srv.Serve(ln) }()
 
 	select {
 	case err := <-errCh:
 		return err
-	case <-done:
+	case <-ctx.Done():
 	}
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	stop()
+	slog.Info("shutting down; interrupt again to exit at once")
+	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
 	return srv.Shutdown(shutdownCtx)
 }
 
-// loadConfig assembles the application config from viper (flags, config file,
-// and environment), falling back to defaults.
-func loadConfig() config.Config {
-	cfg := config.Default()
-
-	if v := viper.GetString("server.host"); v != "" {
-		cfg.Server.Host = v
+func authMiddleware(cfg config.AuthConfig) (func(http.Handler) http.Handler, error) {
+	opts := auth.JWTOptions{
+		Algorithm:           cfg.Algorithm,
+		Issuer:              cfg.Issuer,
+		Audience:            []string{cfg.Audience},
+		CredentialsOptional: cfg.Optional,
 	}
-	if v := viper.GetInt("server.port"); v != 0 {
-		cfg.Server.Port = v
+	if cfg.IsRSA() {
+		pemBytes, err := os.ReadFile(cfg.PublicKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("reading auth public key: %w", err)
+		}
+		if opts.RSAPublicKey, err = auth.ParseRSAPublicKey(pemBytes); err != nil {
+			return nil, err
+		}
+	} else {
+		opts.HMACSecret = []byte(cfg.Secret)
 	}
-	if v := viper.GetString("db.driver"); v != "" {
-		cfg.DB.Driver = config.Driver(v)
-	}
-	if v := viper.GetString("db.uri"); v != "" {
-		cfg.DB.URI = v
-	}
-	if v := viper.GetString("db.token"); v != "" {
-		cfg.DB.Token = v
-	}
-	if v := viper.GetInt("server.max_page_size"); v != 0 {
-		cfg.MaxPageSize = v
-	}
-	if v := viper.GetStringSlice("allow_tables"); len(v) != 0 {
-		cfg.AllowTables = v
-	}
-
-	cfg.Auth.Enabled = viper.GetBool("auth.enabled")
-	cfg.Auth.Algorithm = viper.GetString("auth.algorithm")
-	cfg.Auth.Secret = viper.GetString("auth.secret")
-	cfg.Auth.PublicKeyPath = viper.GetString("auth.public_key_path")
-	cfg.Auth.Issuer = viper.GetString("auth.issuer")
-	cfg.Auth.Audience = viper.GetString("auth.audience")
-	cfg.Auth.Optional = viper.GetBool("auth.optional")
-	return cfg
-}
-
-func init() {
-	rootCmd.AddCommand(serveCmd)
-
-	serveCmd.Flags().IntP("port", "p", 8080, "port to start the server on")
-	serveCmd.Flags().String("host", "", "host/interface to bind (empty binds all interfaces)")
-	serveCmd.Flags().String("driver", string(config.DriverSQLite), "database driver: sqlite or libsql")
-	serveCmd.Flags().String("uri", "", "database connection URI")
-	serveCmd.Flags().String("token", "", "libsql auth token")
-	serveCmd.Flags().Bool("auth", false, "enable JWT authentication")
-	serveCmd.Flags().String("auth-algorithm", "", "JWT signing algorithm: HS256 (default) or RS256")
-	serveCmd.Flags().String("auth-secret", "", "HMAC secret used to verify HS* JWTs")
-	serveCmd.Flags().String("auth-public-key", "", "path to PEM RSA public key used to verify RS* JWTs")
-
-	must(viper.BindPFlag("server.host", serveCmd.Flags().Lookup("host")))
-	must(viper.BindPFlag("server.port", serveCmd.Flags().Lookup("port")))
-	must(viper.BindPFlag("db.driver", serveCmd.Flags().Lookup("driver")))
-	must(viper.BindPFlag("db.uri", serveCmd.Flags().Lookup("uri")))
-	must(viper.BindPFlag("db.token", serveCmd.Flags().Lookup("token")))
-	must(viper.BindPFlag("auth.enabled", serveCmd.Flags().Lookup("auth")))
-	must(viper.BindPFlag("auth.algorithm", serveCmd.Flags().Lookup("auth-algorithm")))
-	must(viper.BindPFlag("auth.secret", serveCmd.Flags().Lookup("auth-secret")))
-	must(viper.BindPFlag("auth.public_key_path", serveCmd.Flags().Lookup("auth-public-key")))
-}
-
-func must(err error) {
-	if err != nil {
-		slog.Error("failed to bind flag", "err", err)
-		os.Exit(1)
-	}
+	return auth.NewJWTMiddleware(opts)
 }

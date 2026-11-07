@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 
@@ -11,35 +12,27 @@ import (
 	"github.com/JayJamieson/libsql-rest/internal/store"
 )
 
-// maxBodyBytes caps request bodies to guard against oversized payloads.
-const maxBodyBytes = 1 << 20 // 1 MiB
+const maxBodyBytes = 1 << 20
 
-// HandlerConfig carries document-level settings the handlers need beyond the
-// store (things not derivable from the schema).
+var (
+	errInvalidBody  = errors.New("invalid request body")
+	errBodyTooLarge = errors.New("request body is larger than 1 MiB")
+)
+
 type HandlerConfig struct {
-	// AuthEnabled reflects whether JWT auth is on, so the generated OpenAPI spec
-	// advertises the security requirement.
-	AuthEnabled bool
-	// Title and Version label the generated OpenAPI document.
-	Title   string
-	Version string
+	TokenRequired bool
+	Version       string
 }
 
-// Handler holds the dependencies HTTP handlers need. It depends on the Store
-// interface rather than a concrete database, which is what makes the handlers
-// unit-testable with a fake or in-memory store.
 type Handler struct {
 	store store.Store
 	cfg   HandlerConfig
 }
 
-// NewHandler constructs a Handler over the given store.
 func NewHandler(s store.Store, cfg HandlerConfig) *Handler {
 	return &Handler{store: s, cfg: cfg}
 }
 
-// Routes returns an http.Handler with all API routes registered. Route
-// registration lives here so the mux can be exercised directly in tests.
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /openapi.json", h.OpenAPI)
@@ -52,26 +45,23 @@ func (h *Handler) Routes() http.Handler {
 	return mux
 }
 
-// OpenAPI handles GET /openapi.json, generating a schema-aware spec from the
-// live database so clients can be generated with typed per-table models.
 func (h *Handler) OpenAPI(w http.ResponseWriter, r *http.Request) {
-	tables, err := h.store.Schema(r.Context())
+	tables, err := h.store.Tables(r.Context())
 	if err != nil {
-		writeStoreError(w, err)
+		writeError(w, err)
 		return
 	}
-	doc := openapi.Build(tables, openapi.Options{
-		Title:       h.cfg.Title,
-		Version:     h.cfg.Version,
-		ServerURL:   baseURL(r),
-		AuthEnabled: h.cfg.AuthEnabled,
-	})
-	writeJSON(w, http.StatusOK, doc)
+	writeJSON(w, http.StatusOK, openapi.Build(tables, openapi.Options{
+		Version:       h.cfg.Version,
+		ServerURL:     baseURL(r),
+		TokenRequired: h.cfg.TokenRequired,
+	}))
 }
 
-// baseURL reconstructs the externally-visible base URL of the request so the
-// generated spec's server points clients at the right host.
 func baseURL(r *http.Request) string {
+	if r.Host == "" {
+		return ""
+	}
 	scheme := "http"
 	if r.TLS != nil {
 		scheme = "https"
@@ -79,102 +69,129 @@ func baseURL(r *http.Request) string {
 	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
 		scheme = proto
 	}
-	if r.Host == "" {
-		return ""
-	}
 	return scheme + "://" + r.Host
 }
 
-// ListTables handles GET /api/tables.
+type tableInfo struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
 func (h *Handler) ListTables(w http.ResponseWriter, r *http.Request) {
 	tables, err := h.store.Tables(r.Context())
 	if err != nil {
-		writeStoreError(w, err)
+		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, tables)
+	out := make([]tableInfo, len(tables))
+	for i, t := range tables {
+		out[i] = tableInfo{Name: t.Name, Type: t.Type}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
-// ListRows handles GET /api/{table} with PostgREST-style filtering.
 func (h *Handler) ListRows(w http.ResponseWriter, r *http.Request) {
-	req, err := query.ParseListRequest(r.URL.Query())
+	req, err := query.ParseListRequest(r.URL.RawQuery)
 	if err != nil {
-		writeStoreError(w, err)
+		writeError(w, err)
 		return
 	}
 	rows, err := h.store.List(r.Context(), r.PathValue("table"), req)
 	if err != nil {
-		writeStoreError(w, err)
+		writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, rows)
 }
 
-// GetRow handles GET /api/{table}/{pk}.
 func (h *Handler) GetRow(w http.ResponseWriter, r *http.Request) {
 	row, err := h.store.Get(r.Context(), r.PathValue("table"), r.PathValue("pk"))
 	if err != nil {
-		writeStoreError(w, err)
+		writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, row)
 }
 
-// CreateRow handles POST /api/{table}.
 func (h *Handler) CreateRow(w http.ResponseWriter, r *http.Request) {
-	body, err := decodeRow(r)
+	body, err := decodeRow(w, r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeError(w, err)
 		return
 	}
 	row, err := h.store.Insert(r.Context(), r.PathValue("table"), body)
 	if err != nil {
-		writeStoreError(w, err)
+		writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, row)
 }
 
-// UpdateRow handles PATCH /api/{table}/{pk}.
 func (h *Handler) UpdateRow(w http.ResponseWriter, r *http.Request) {
-	body, err := decodeRow(r)
+	body, err := decodeRow(w, r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeError(w, err)
 		return
 	}
 	row, err := h.store.Update(r.Context(), r.PathValue("table"), r.PathValue("pk"), body)
 	if err != nil {
-		writeStoreError(w, err)
+		writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, row)
 }
 
-// DeleteRow handles DELETE /api/{table}/{pk}.
 func (h *Handler) DeleteRow(w http.ResponseWriter, r *http.Request) {
-	err := h.store.Delete(r.Context(), r.PathValue("table"), r.PathValue("pk"))
-	if err != nil {
-		writeStoreError(w, err)
+	if err := h.store.Delete(r.Context(), r.PathValue("table"), r.PathValue("pk")); err != nil {
+		writeError(w, err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// decodeRow reads and validates a JSON object request body.
-func decodeRow(r *http.Request) (store.Row, error) {
-	r.Body = http.MaxBytesReader(nil, r.Body, maxBodyBytes)
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
+func decodeRow(w http.ResponseWriter, r *http.Request) (store.Row, error) {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBodyBytes))
+	dec.UseNumber()
 
 	var row store.Row
 	if err := dec.Decode(&row); err != nil {
-		if errors.Is(err, io.EOF) {
-			return nil, errors.New("request body is empty")
+		var tooLarge *http.MaxBytesError
+		switch {
+		case errors.As(err, &tooLarge):
+			return nil, errBodyTooLarge
+		case errors.Is(err, io.EOF):
+			return nil, fmt.Errorf("%w: empty", errInvalidBody)
+		default:
+			return nil, fmt.Errorf("%w: expected a JSON object", errInvalidBody)
 		}
-		return nil, errors.New("invalid JSON body")
+	}
+	if err := dec.Decode(&json.RawMessage{}); !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("%w: unexpected data after the JSON object", errInvalidBody)
 	}
 	if len(row) == 0 {
-		return nil, errors.New("request body must be a non-empty JSON object")
+		return nil, fmt.Errorf("%w: expected at least one column", errInvalidBody)
+	}
+
+	for col, v := range row {
+		switch v := v.(type) {
+		case json.Number:
+			n, err := parseNumber(v)
+			if err != nil {
+				return nil, fmt.Errorf("%w: column %q: %v", errInvalidBody, col, err)
+			}
+			row[col] = n
+		case map[string]any, []any:
+			return nil, fmt.Errorf("%w: column %q: nested objects and arrays are not supported", errInvalidBody, col)
+		}
 	}
 	return row, nil
+}
+
+// parseNumber keeps integers exact. Decoding straight to float64 would round
+// any integer above 2^53.
+func parseNumber(n json.Number) (any, error) {
+	if i, err := n.Int64(); err == nil {
+		return i, nil
+	}
+	return n.Float64()
 }

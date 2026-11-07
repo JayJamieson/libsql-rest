@@ -5,70 +5,65 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
 )
 
-// keygenCmd generates an RSA key pair for local RS256 development: the private
-// key mints tokens (`token --algorithm RS256 --private-key ...`) and the public
-// key verifies them (`serve --auth-algorithm RS256 --auth-public-key ...`).
-var keygenCmd = &cobra.Command{
-	Use:   "keygen",
-	Short: "generate an RSA key pair for RS256 JWTs",
-	Long: `Generate an RSA key pair for local RS256 development.
+func newKeygenCmd() *cobra.Command {
+	var (
+		bits            int
+		privOut, pubOut string
+	)
+	cmd := &cobra.Command{
+		Use:   "keygen",
+		Short: "Generate an RSA key pair for RS256 tokens",
+		Long: `Generate an RSA key pair for development with RS256 tokens.
 
-The private key signs tokens; the server only needs the public key to verify
-them. Do not use development keys in production.`,
-	RunE: runKeygen,
+'token --private-key' signs with the private key, and 'serve --auth-public-key'
+verifies with the public key. keygen does not overwrite existing files.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			key, err := rsa.GenerateKey(rand.Reader, bits)
+			if err != nil {
+				return fmt.Errorf("generating key: %w", err)
+			}
+			privDER, err := x509.MarshalPKCS8PrivateKey(key)
+			if err != nil {
+				return fmt.Errorf("encoding private key: %w", err)
+			}
+			pubDER, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
+			if err != nil {
+				return fmt.Errorf("encoding public key: %w", err)
+			}
+
+			if err := writeNewFile(privOut, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privDER}), 0o600); err != nil {
+				return err
+			}
+			if err := writeNewFile(pubOut, pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubDER}), 0o644); err != nil {
+				return errors.Join(err, os.Remove(privOut))
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "wrote private key to %s\nwrote public key to %s\n", privOut, pubOut)
+			return err
+		},
+	}
+
+	f := cmd.Flags()
+	f.IntVar(&bits, "bits", 2048, "RSA key size in bits")
+	f.StringVar(&privOut, "private-out", "jwt-private.pem", "path for the private key")
+	f.StringVar(&pubOut, "public-out", "jwt-public.pem", "path for the public key")
+	return cmd
 }
 
-func runKeygen(cmd *cobra.Command, args []string) error {
-	bits, _ := cmd.Flags().GetInt("bits")
-	privPath := mustString(cmd, "private-out")
-	pubPath := mustString(cmd, "public-out")
-
-	key, err := rsa.GenerateKey(rand.Reader, bits)
+func writeNewFile(path string, data []byte, perm os.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
 	if err != nil {
-		return fmt.Errorf("generating key: %w", err)
+		return err
 	}
-
-	privPEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "PRIVATE KEY",
-		Bytes: mustMarshalPKCS8(key),
-	})
-	pubBytes, err := x509.MarshalPKIXPublicKey(&key.PublicKey)
-	if err != nil {
-		return fmt.Errorf("marshaling public key: %w", err)
+	if _, err := f.Write(data); err != nil {
+		return errors.Join(err, f.Close())
 	}
-	pubPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: pubBytes})
-
-	// Private key is secret material: write it 0600.
-	if err := os.WriteFile(privPath, privPEM, 0o600); err != nil {
-		return fmt.Errorf("writing private key: %w", err)
-	}
-	if err := os.WriteFile(pubPath, pubPEM, 0o644); err != nil {
-		return fmt.Errorf("writing public key: %w", err)
-	}
-
-	fmt.Fprintf(cmd.OutOrStdout(), "wrote private key to %s\nwrote public key to %s\n", privPath, pubPath)
-	return nil
-}
-
-func mustMarshalPKCS8(key *rsa.PrivateKey) []byte {
-	b, err := x509.MarshalPKCS8PrivateKey(key)
-	if err != nil {
-		// MarshalPKCS8PrivateKey only errors for unsupported key types; RSA is
-		// always supported, so this is unreachable.
-		panic(err)
-	}
-	return b
-}
-
-func init() {
-	rootCmd.AddCommand(keygenCmd)
-	keygenCmd.Flags().Int("bits", 2048, "RSA key size in bits")
-	keygenCmd.Flags().String("private-out", "jwt-private.pem", "path to write the private key")
-	keygenCmd.Flags().String("public-out", "jwt-public.pem", "path to write the public key")
+	return f.Close()
 }

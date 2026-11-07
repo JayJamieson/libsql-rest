@@ -4,16 +4,14 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 )
 
-// ParseRSAPublicKey parses an RSA public key from PEM bytes. It accepts both
-// PKIX ("BEGIN PUBLIC KEY") and PKCS#1 ("BEGIN RSA PUBLIC KEY") encodings, which
-// covers keys produced by openssl and most identity providers.
 func ParseRSAPublicKey(pemBytes []byte) (*rsa.PublicKey, error) {
 	block, _ := pem.Decode(pemBytes)
 	if block == nil {
-		return nil, fmt.Errorf("no PEM block found in public key")
+		return nil, errors.New("no PEM block found in public key")
 	}
 	switch block.Type {
 	case "PUBLIC KEY":
@@ -33,13 +31,10 @@ func ParseRSAPublicKey(pemBytes []byte) (*rsa.PublicKey, error) {
 	}
 }
 
-// ParseRSAPrivateKey parses an RSA private key from PEM bytes. It accepts both
-// PKCS#1 ("BEGIN RSA PRIVATE KEY") and PKCS#8 ("BEGIN PRIVATE KEY") encodings.
-// It is used only by the local token-minting command, not by the server.
 func ParseRSAPrivateKey(pemBytes []byte) (*rsa.PrivateKey, error) {
 	block, _ := pem.Decode(pemBytes)
 	if block == nil {
-		return nil, fmt.Errorf("no PEM block found in private key")
+		return nil, errors.New("no PEM block found in private key")
 	}
 	switch block.Type {
 	case "RSA PRIVATE KEY":

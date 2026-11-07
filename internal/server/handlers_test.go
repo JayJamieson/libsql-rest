@@ -27,6 +27,13 @@ func newTestServer(t *testing.T, allow store.AllowFunc) http.Handler {
 		`CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER)`,
 		`INSERT INTO users (id, name, age) VALUES (1,'ada',36),(2,'linus',54),(3,'grace',85)`,
 		`CREATE TABLE secret (id INTEGER PRIMARY KEY, val TEXT)`,
+		`CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)`,
+		`CREATE VIEW adults AS SELECT * FROM users WHERE age >= 18`,
+		`CREATE VIEW stats AS SELECT count(*) AS n FROM users`,
+		`CREATE TABLE accounts (id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL)`,
+		`INSERT INTO accounts (id, email) VALUES (1, 'ada@example.com')`,
+		`CREATE TABLE logs (msg TEXT)`,
+		`INSERT INTO logs (msg) VALUES ('first')`,
 	}
 	for _, s := range seed {
 		if _, err := db.Exec(s); err != nil {
@@ -147,12 +154,29 @@ func TestBadRequests(t *testing.T) {
 		method, target, body string
 		want                 int
 	}{
-		{"GET", "/api/users?age=bogus.1", "", http.StatusBadRequest}, // bad operator
-		{"GET", "/api/users?nope=eq.1", "", http.StatusBadRequest},   // unknown column
-		{"GET", "/api/missing", "", http.StatusNotFound},             // unknown table
-		{"POST", "/api/users", `not json`, http.StatusBadRequest},    // malformed body
-		{"POST", "/api/users", `{}`, http.StatusBadRequest},          // empty body
-		{"POST", "/api/users", `{"nope":1}`, http.StatusBadRequest},  // unknown column
+		{"GET", "/api/users?age=bogus.1", "", http.StatusBadRequest},
+		{"GET", "/api/users?nope=eq.1", "", http.StatusBadRequest},
+		{"GET", "/api/missing", "", http.StatusNotFound},
+		{"POST", "/api/users", `not json`, http.StatusBadRequest},
+		{"POST", "/api/users", `{}`, http.StatusBadRequest},
+		{"POST", "/api/users", `[{"name":"x"}]`, http.StatusBadRequest},
+		{"POST", "/api/users", `{"nope":1}`, http.StatusBadRequest},
+		{"POST", "/api/users", `{"name":"x"} {"name":"y"}`, http.StatusBadRequest},
+		{"POST", "/api/users", `{"name":{"first":"x"}}`, http.StatusBadRequest},
+		{"POST", "/api/users", `{"name":["x"]}`, http.StatusBadRequest},
+		{"POST", "/api/users", `{"name":"` + strings.Repeat("x", 1<<20) + `"}`, http.StatusRequestEntityTooLarge},
+		{"POST", "/api/adults", `{"name":"x"}`, http.StatusBadRequest},
+		{"GET", "/api/adults/1", "", http.StatusBadRequest},
+		{"PATCH", "/api/adults/1", `{"name":"x"}`, http.StatusBadRequest},
+		{"DELETE", "/api/adults/1", "", http.StatusBadRequest},
+		{"GET", "/api/logs/1", "", http.StatusBadRequest},
+		{"GET", "/api/users?name=eq.a;b", "", http.StatusBadRequest},
+		{"GET", "/api/users?name=eq.%zz", "", http.StatusBadRequest},
+		{"POST", "/api/accounts", `{"id":2}`, http.StatusBadRequest},
+		{"POST", "/api/accounts", `{"id":"abc","email":"x@example.com"}`, http.StatusBadRequest},
+		{"PATCH", "/api/accounts/1", `{"email":null}`, http.StatusBadRequest},
+		{"POST", "/api/accounts", `{"id":1,"email":"new@example.com"}`, http.StatusConflict},
+		{"POST", "/api/accounts", `{"id":2,"email":"ada@example.com"}`, http.StatusConflict},
 	}
 	for _, c := range cases {
 		rec := do(t, h, c.method, c.target, c.body)
@@ -183,7 +207,6 @@ func TestOpenAPIEndpoint(t *testing.T) {
 	if _, ok := paths["/api/users/{pk}"]; !ok {
 		t.Error("spec missing /api/users/{pk}")
 	}
-	// Server URL is reconstructed from the request host.
 	servers := doc["servers"].([]any)
 	if url := servers[0].(map[string]any)["url"]; url != "http://example.com" {
 		t.Errorf("server url = %v", url)
@@ -212,8 +235,49 @@ func TestAllowListHidesTable(t *testing.T) {
 	}
 }
 
-// jsonNum renders a JSON-decoded number (float64) or existing string as a
-// base-10 integer string for use in URLs and comparisons.
+func TestCreateKeepsNumbersExact(t *testing.T) {
+	h := newTestServer(t, nil)
+	rec := do(t, h, "POST", "/api/notes", `{"id": 9007199254740993, "body": 7}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body)
+	}
+	want := `{"body":"7","id":9007199254740993}`
+	if got := strings.TrimSpace(rec.Body.String()); got != want {
+		t.Errorf("body = %s, want %s", got, want)
+	}
+}
+
+func TestConstraintErrorNamesTheColumn(t *testing.T) {
+	h := newTestServer(t, nil)
+	rec := do(t, h, "POST", "/api/accounts", `{"id":2,"email":"ada@example.com"}`)
+	want := `{"error":"conflict: UNIQUE constraint failed: accounts.email"}`
+	if got := strings.TrimSpace(rec.Body.String()); got != want {
+		t.Errorf("body = %s, want %s", got, want)
+	}
+}
+
+func TestFilterUntypedViewColumn(t *testing.T) {
+	h := newTestServer(t, nil)
+	rec := do(t, h, "GET", "/api/stats?n=eq.3", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body)
+	}
+	if rows := decodeList(t, rec); len(rows) != 1 {
+		t.Errorf("rows = %v, want the one stats row", rows)
+	}
+}
+
+func TestListViewRows(t *testing.T) {
+	h := newTestServer(t, nil)
+	rec := do(t, h, "GET", "/api/adults?order=id.asc", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body)
+	}
+	if rows := decodeList(t, rec); len(rows) != 3 {
+		t.Errorf("rows = %v", rows)
+	}
+}
+
 func jsonNum(t *testing.T, v any) string {
 	t.Helper()
 	switch n := v.(type) {

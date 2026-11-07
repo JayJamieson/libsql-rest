@@ -22,11 +22,7 @@ func testTable() *schema.Table {
 
 func parse(t *testing.T, raw string) ListRequest {
 	t.Helper()
-	v, err := url.ParseQuery(raw)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req, err := ParseListRequest(v)
+	req, err := ParseListRequest(raw)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +66,6 @@ func TestBuildSelect_FiltersOrderPaging(t *testing.T) {
 }
 
 func TestBuildSelect_LimitClamp(t *testing.T) {
-	// Explicit limit above the cap is clamped; unset limit defaults to the cap.
 	got, _ := BuildSelect(testTable(), parse(t, "limit=9999"), 100)
 	if !strings.Contains(got.SQL, "LIMIT 100") {
 		t.Errorf("clamp failed: %q", got.SQL)
@@ -92,7 +87,6 @@ func TestBuildSelect_InIsLikeNegate(t *testing.T) {
 			t.Errorf("SQL %q missing %q", stmt.SQL, frag)
 		}
 	}
-	// LIKE wildcard translation `*` -> `%`.
 	foundPattern := false
 	for _, a := range stmt.Args {
 		if a == "jo%" {
@@ -106,9 +100,9 @@ func TestBuildSelect_InIsLikeNegate(t *testing.T) {
 
 func TestBuildSelect_RejectsUnknownColumns(t *testing.T) {
 	cases := []string{
-		"nope=eq.1",      // filter on unknown column
-		"order=nope.asc", // order by unknown column
-		"select=nope",    // select unknown column
+		"nope=eq.1",
+		"order=nope.asc",
+		"select=nope",
 	}
 	for _, raw := range cases {
 		if _, err := BuildSelect(testTable(), parse(t, raw), 100); err == nil {
@@ -117,11 +111,9 @@ func TestBuildSelect_RejectsUnknownColumns(t *testing.T) {
 	}
 }
 
-// TestBuildSelect_InjectionAttemptRejected ensures a crafted column name cannot
-// smuggle SQL: it simply fails identifier validation.
 func TestBuildSelect_InjectionAttemptRejected(t *testing.T) {
 	raw := url.Values{"name`); DROP TABLE users;--": {"eq.x"}}
-	req, err := ParseListRequest(raw)
+	req, err := ParseListRequest(raw.Encode())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +127,6 @@ func TestBuildInsert(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Columns emitted in table declaration order: name before age.
 	if !strings.HasPrefix(stmt.SQL, "INSERT INTO `users` (`name`, `age`) VALUES (?, ?)") {
 		t.Errorf("SQL = %q", stmt.SQL)
 	}
@@ -157,7 +148,8 @@ func TestBuildInsert_RejectsUnknownColumnAndEmpty(t *testing.T) {
 }
 
 func TestBuildUpdateDelete(t *testing.T) {
-	up, err := BuildUpdate(testTable(), "id", "7", map[string]any{"age": 40})
+	key := testTable().Columns[0]
+	up, err := BuildUpdate(testTable(), key, "7", map[string]any{"age": 40})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,8 +160,23 @@ func TestBuildUpdateDelete(t *testing.T) {
 		t.Errorf("update args = %v", up.Args)
 	}
 
-	del := BuildDelete(testTable(), "id", "7")
+	del := BuildDelete(testTable(), key, "7")
 	if del.SQL != "DELETE FROM `users` WHERE `id` = ?" {
 		t.Errorf("delete SQL = %q", del.SQL)
+	}
+}
+
+func TestBuildSelect_BindsNumbersForUntypedColumns(t *testing.T) {
+	view := &schema.Table{Name: "stats", Type: "view", Columns: []schema.Column{
+		{Name: "label", Type: "TEXT"},
+		{Name: "n"},
+	}}
+	got, err := BuildSelect(view, parse(t, "n=gt.2&label=eq.007"), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []any{"007", int64(2)}
+	if len(got.Args) != 2 || got.Args[0] != want[0] || got.Args[1] != want[1] {
+		t.Errorf("args = %#v, want %#v", got.Args, want)
 	}
 }

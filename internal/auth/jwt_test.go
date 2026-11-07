@@ -21,7 +21,6 @@ const (
 	testAudience = "libsql-rest-test"
 )
 
-// signToken mints an HS256 token for tests, applying the given claim overrides.
 func signToken(t *testing.T, mutate func(jwt.MapClaims)) string {
 	t.Helper()
 	now := time.Now()
@@ -42,7 +41,6 @@ func signToken(t *testing.T, mutate func(jwt.MapClaims)) string {
 	return s
 }
 
-// captureHandler records the principal it sees and returns 200.
 func captureHandler(seen **auth.Principal) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := auth.FromContext(r.Context())
@@ -51,9 +49,10 @@ func captureHandler(seen **auth.Principal) http.Handler {
 	})
 }
 
-func newMW(t *testing.T, optional bool) auth.Middleware {
+func newMW(t *testing.T, optional bool) func(http.Handler) http.Handler {
 	t.Helper()
 	mw, err := auth.NewJWTMiddleware(auth.JWTOptions{
+		Algorithm:           "HS256",
 		HMACSecret:          []byte(testSecret),
 		Issuer:              testIssuer,
 		Audience:            []string{testAudience},
@@ -107,7 +106,6 @@ func TestMissingTokenRejectedWhenRequired(t *testing.T) {
 	if seen != nil {
 		t.Error("handler should not run without a token")
 	}
-	// Error uses our JSON envelope.
 	var body map[string]string
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body["error"] == "" {
 		t.Errorf("unexpected error body: %s", rec.Body)
@@ -129,6 +127,7 @@ func TestInvalidAndExpiredTokensRejected(t *testing.T) {
 		"wrong issuer":   signToken(t, func(c jwt.MapClaims) { c["iss"] = "someone-else" }),
 		"wrong audience": signToken(t, func(c jwt.MapClaims) { c["aud"] = "someone-else" }),
 		"garbage":        "not-a-jwt",
+		"no expiry":      signToken(t, func(c jwt.MapClaims) { delete(c, "exp") }),
 	}
 	for name, token := range cases {
 		if rec := request(h, token); rec.Code != http.StatusUnauthorized {
@@ -141,7 +140,6 @@ func TestOptionalCredentialsAllowAnonymous(t *testing.T) {
 	var seen *auth.Principal
 	h := newMW(t, true)(captureHandler(&seen))
 
-	// No token: request proceeds as anonymous (the RLS seam).
 	rec := request(h, "")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", rec.Code)
@@ -150,14 +148,13 @@ func TestOptionalCredentialsAllowAnonymous(t *testing.T) {
 		t.Errorf("expected anonymous principal, got %+v", seen)
 	}
 
-	// A present-but-invalid token is still rejected even when optional.
 	if rec := request(h, "garbage"); rec.Code != http.StatusUnauthorized {
 		t.Errorf("invalid token with optional creds: status = %d, want 401", rec.Code)
 	}
 }
 
 func TestNewJWTMiddlewareValidation(t *testing.T) {
-	base := auth.JWTOptions{Issuer: testIssuer, Audience: []string{testAudience}}
+	base := auth.JWTOptions{Algorithm: "HS256", Issuer: testIssuer, Audience: []string{testAudience}}
 
 	if _, err := auth.NewJWTMiddleware(base); err == nil {
 		t.Error("expected error for missing HMAC secret")
@@ -197,7 +194,6 @@ func TestRS256RoundTrip(t *testing.T) {
 		"exp": time.Now().Add(time.Hour).Unix(),
 	}
 
-	// A token signed with the matching private key is accepted.
 	good, err := jwt.NewWithClaims(jwt.SigningMethodRS256, claims).SignedString(key)
 	if err != nil {
 		t.Fatal(err)
@@ -205,19 +201,16 @@ func TestRS256RoundTrip(t *testing.T) {
 	if rec := request(h, good); rec.Code != http.StatusOK {
 		t.Fatalf("valid RS256 token: status = %d body=%s", rec.Code, rec.Body)
 	}
-	if seen.UserID() != "user-rsa" {
-		t.Errorf("UserID = %q", seen.UserID())
+	if seen.Subject != "user-rsa" {
+		t.Errorf("Subject = %q", seen.Subject)
 	}
 
-	// A token signed by a different key is rejected.
 	otherKey, _ := rsa.GenerateKey(rand.Reader, 2048)
 	bad, _ := jwt.NewWithClaims(jwt.SigningMethodRS256, claims).SignedString(otherKey)
 	if rec := request(h, bad); rec.Code != http.StatusUnauthorized {
 		t.Errorf("token from wrong key: status = %d, want 401", rec.Code)
 	}
 
-	// Algorithm confusion: an HS256 token whose "secret" is the RSA public key
-	// must be rejected because the middleware pins RS256.
 	pubPEM := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: mustMarshalPKIX(t, &key.PublicKey)})
 	forged, _ := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(pubPEM)
 	if rec := request(h, forged); rec.Code != http.StatusUnauthorized {
@@ -234,7 +227,6 @@ func mustMarshalPKIX(t *testing.T, pub *rsa.PublicKey) []byte {
 	return der
 }
 
-// ParseRSA* helpers are covered here since keygen writes PKCS8/PKIX PEM.
 func TestParseRSAKeysRoundTrip(t *testing.T) {
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {

@@ -1,3 +1,4 @@
+// Package db opens a database/sql handle for the sqlite or libsql driver.
 package db
 
 import (
@@ -9,15 +10,10 @@ import (
 
 	"github.com/JayJamieson/libsql-rest/internal/config"
 
-	// Register the libsql driver under the name "libsql".
 	_ "github.com/tursodatabase/libsql-client-go/libsql"
-	// Register the pure-Go sqlite driver under the name "sqlite".
 	_ "modernc.org/sqlite"
 )
 
-// Open opens a *sql.DB for the configured driver. The libsql and sqlite
-// drivers are SQLite-compatible, so the rest of the application can treat the
-// returned handle uniformly and swap backends via configuration alone.
 func Open(cfg config.DBConfig) (*sql.DB, error) {
 	driver, dsn, err := resolve(cfg)
 	if err != nil {
@@ -28,17 +24,13 @@ func Open(cfg config.DBConfig) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	// libsql streams connections and will surface STREAM_EXPIRED errors when a
-	// connection is held idle past the server timeout, so recycle idle
-	// connections proactively. (Previously this was `9`, i.e. 9 nanoseconds.)
+	// A libsql server expires idle streams, and reusing one fails with
+	// STREAM_EXPIRED. Close idle connections before the server does.
 	sqlDB.SetConnMaxIdleTime(9 * time.Second)
-
 	return sqlDB, nil
 }
 
-// resolve maps a DBConfig to the underlying database/sql driver name and DSN.
-func resolve(cfg config.DBConfig) (driver string, dsn string, err error) {
+func resolve(cfg config.DBConfig) (driver, dsn string, err error) {
 	switch cfg.Driver {
 	case config.DriverSQLite:
 		return "sqlite", sqliteDSN(cfg.URI), nil
@@ -49,21 +41,27 @@ func resolve(cfg config.DBConfig) (driver string, dsn string, err error) {
 	}
 }
 
-// sqliteDSN normalizes a user-supplied URI for the modernc sqlite driver,
-// which accepts a bare filename or a "file:" DSN.
+// sqliteDSN sets a busy timeout unless the URI sets one. Without it, a request
+// that finds the database locked by another request's write fails at once
+// with SQLITE_BUSY instead of waiting for the lock.
 func sqliteDSN(uri string) string {
-	return strings.TrimPrefix(uri, "sqlite://")
+	dsn := strings.TrimPrefix(uri, "sqlite://")
+	if strings.Contains(dsn, "busy_timeout") {
+		return dsn
+	}
+	return withParam(dsn, "_pragma=busy_timeout(5000)")
 }
 
-// libsqlDSN appends the auth token to a libsql URI as a query parameter,
-// preserving any parameters already present.
 func libsqlDSN(uri, token string) string {
 	if token == "" {
 		return uri
 	}
-	sep := "?"
-	if strings.Contains(uri, "?") {
-		sep = "&"
+	return withParam(uri, "authToken="+url.QueryEscape(token))
+}
+
+func withParam(dsn, param string) string {
+	if strings.Contains(dsn, "?") {
+		return dsn + "&" + param
 	}
-	return fmt.Sprintf("%s%sauthToken=%s", uri, sep, url.QueryEscape(token))
+	return dsn + "?" + param
 }

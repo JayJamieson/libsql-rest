@@ -12,7 +12,6 @@ func sampleTables() []schema.Table {
 			Name: "users",
 			Type: "table",
 			Columns: []schema.Column{
-				// INTEGER PRIMARY KEY: SQLite reports notnull=0 but it is never null.
 				{Name: "id", Type: "INTEGER", NotNull: false, PKIndex: 1},
 				{Name: "name", Type: "TEXT", NotNull: true},
 				{Name: "age", Type: "INTEGER"},
@@ -25,6 +24,7 @@ func sampleTables() []schema.Table {
 			Columns: []schema.Column{
 				{Name: "id", Type: "INTEGER"},
 				{Name: "name", Type: "TEXT"},
+				{Name: "total"},
 			},
 		},
 		{
@@ -39,7 +39,7 @@ func sampleTables() []schema.Table {
 }
 
 func TestBuildTopLevel(t *testing.T) {
-	doc := Build(sampleTables(), Options{ServerURL: "http://localhost:8080", AuthEnabled: true})
+	doc := Build(sampleTables(), Options{ServerURL: "http://localhost:8080", TokenRequired: true})
 
 	if doc["openapi"] != "3.0.3" {
 		t.Errorf("openapi = %v", doc["openapi"])
@@ -57,7 +57,6 @@ func TestBuildPaths(t *testing.T) {
 	doc := Build(sampleTables(), Options{})
 	paths := doc["paths"].(map[string]any)
 
-	// Base table: collection + item routes.
 	if _, ok := paths["/api/users"]; !ok {
 		t.Error("missing /api/users")
 	}
@@ -75,7 +74,6 @@ func TestBuildPaths(t *testing.T) {
 		t.Error("base table should support POST")
 	}
 
-	// View: list only, no POST, no item route.
 	viewCol, ok := paths["/api/active_users"].(map[string]any)
 	if !ok {
 		t.Fatal("missing /api/active_users")
@@ -87,7 +85,6 @@ func TestBuildPaths(t *testing.T) {
 		t.Error("view should not have an item route")
 	}
 
-	// Composite-key table: no item route (can't be addressed by one path value).
 	if _, ok := paths["/api/events/{pk}"]; ok {
 		t.Error("composite-key table should not have an item route")
 	}
@@ -103,30 +100,26 @@ func TestBuildSchemas(t *testing.T) {
 	}
 	props := users["properties"].(map[string]any)
 
-	// Type mapping.
 	if props["id"].(map[string]any)["type"] != "integer" {
 		t.Errorf("id type = %v", props["id"])
 	}
 	if props["name"].(map[string]any)["type"] != "string" {
 		t.Errorf("name type = %v", props["name"])
 	}
-	if props["active"].(map[string]any)["type"] != "boolean" {
+	if props["active"].(map[string]any)["type"] != "integer" {
 		t.Errorf("active type = %v", props["active"])
 	}
-	// Nullable column carries nullable: true; NOT NULL does not.
 	if props["age"].(map[string]any)["nullable"] != true {
 		t.Errorf("age should be nullable: %v", props["age"])
 	}
 	if _, ok := props["name"].(map[string]any)["nullable"]; ok {
 		t.Errorf("NOT NULL name should not be nullable: %v", props["name"])
 	}
-	// A primary-key column is never nullable, even when notnull=0.
 	if _, ok := props["id"].(map[string]any)["nullable"]; ok {
 		t.Errorf("primary-key id should not be nullable: %v", props["id"])
 	}
 
-	// Response schema requires all columns; input schema requires none.
-	if len(users["required"].([]any)) != 4 {
+	if len(users["required"].([]string)) != 4 {
 		t.Errorf("response required = %v", users["required"])
 	}
 	input := schemas["usersInput"].(map[string]any)
@@ -134,7 +127,11 @@ func TestBuildSchemas(t *testing.T) {
 		t.Errorf("input schema should have no required fields: %v", input["required"])
 	}
 
-	// Base component schemas exist.
+	view := schemas["active_users"].(map[string]any)["properties"].(map[string]any)
+	if typ, ok := view["total"].(map[string]any)["type"]; ok {
+		t.Errorf("untyped column has type %v, want none", typ)
+	}
+
 	for _, name := range []string{"Error", "Table"} {
 		if _, ok := schemas[name]; !ok {
 			t.Errorf("missing base schema %q", name)
@@ -150,8 +147,8 @@ func TestSanitizeSchemaName(t *testing.T) {
 		"123table":    "t_123table",
 	}
 	for in, want := range cases {
-		if got := schemaName(in); got != want {
-			t.Errorf("schemaName(%q) = %q, want %q", in, got, want)
+		if got := sanitize(in); got != want {
+			t.Errorf("sanitize(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

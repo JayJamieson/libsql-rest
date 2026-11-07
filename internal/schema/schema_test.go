@@ -1,7 +1,6 @@
 package schema_test
 
 import (
-	"context"
 	"database/sql"
 	"errors"
 	"testing"
@@ -35,7 +34,7 @@ func TestTables(t *testing.T) {
 	db := newDB(t)
 	in := schema.NewSQLIntrospector(db)
 
-	tables, err := in.Tables(context.Background())
+	tables, err := in.Tables(t.Context())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +51,7 @@ func TestTableColumnsAndPK(t *testing.T) {
 	db := newDB(t)
 	in := schema.NewSQLIntrospector(db)
 
-	users, err := in.Table(context.Background(), "users")
+	users, err := in.Table(t.Context(), "users")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +70,7 @@ func TestTableColumnsAndPK(t *testing.T) {
 func TestColumnNullable(t *testing.T) {
 	db := newDB(t)
 	in := schema.NewSQLIntrospector(db)
-	users, err := in.Table(context.Background(), "users")
+	users, err := in.Table(t.Context(), "users")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,15 +78,13 @@ func TestColumnNullable(t *testing.T) {
 	for _, c := range users.Columns {
 		byName[c.Name] = c
 	}
-	// id is INTEGER PRIMARY KEY: SQLite reports notnull=0, but it is a PK so it
-	// must be treated as non-nullable.
 	if id := byName["id"]; !id.IsPrimaryKey() || id.Nullable() {
 		t.Errorf("id: IsPrimaryKey=%v Nullable=%v (want true/false)", id.IsPrimaryKey(), id.Nullable())
 	}
-	if name := byName["name"]; name.Nullable() { // NOT NULL
+	if name := byName["name"]; name.Nullable() {
 		t.Errorf("name should not be nullable")
 	}
-	if age := byName["age"]; !age.Nullable() { // plain nullable column
+	if age := byName["age"]; !age.Nullable() {
 		t.Errorf("age should be nullable")
 	}
 }
@@ -95,7 +92,7 @@ func TestColumnNullable(t *testing.T) {
 func TestCompositePrimaryKeyOrder(t *testing.T) {
 	db := newDB(t)
 	in := schema.NewSQLIntrospector(db)
-	events, err := in.Table(context.Background(), "events")
+	events, err := in.Table(t.Context(), "events")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -108,7 +105,7 @@ func TestCompositePrimaryKeyOrder(t *testing.T) {
 func TestTableNotFound(t *testing.T) {
 	db := newDB(t)
 	in := schema.NewSQLIntrospector(db)
-	_, err := in.Table(context.Background(), "missing")
+	_, err := in.Table(t.Context(), "missing")
 	if !errors.Is(err, schema.ErrTableNotFound) {
 		t.Errorf("err = %v, want ErrTableNotFound", err)
 	}
@@ -117,14 +114,61 @@ func TestTableNotFound(t *testing.T) {
 func TestCacheIsolation(t *testing.T) {
 	db := newDB(t)
 	in := schema.NewSQLIntrospector(db)
-	tbl, err := in.Table(context.Background(), "users")
+	tbl, err := in.Table(t.Context(), "users")
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Mutating the returned copy must not corrupt the cache.
 	tbl.Columns[0].Name = "hacked"
-	again, _ := in.Table(context.Background(), "users")
+	again, _ := in.Table(t.Context(), "users")
 	if again.Columns[0].Name != "id" {
 		t.Errorf("cache mutated: %s", again.Columns[0].Name)
+	}
+}
+
+func TestRowKey(t *testing.T) {
+	db := newDB(t)
+	if _, err := db.Exec(`CREATE TABLE notes (body TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	in := schema.NewSQLIntrospector(db)
+	cases := []struct {
+		table  string
+		want   string
+		wantOK bool
+	}{
+		{"users", "id", true},
+		{"notes", "", false},
+		{"events", "", false},
+		{"active_users", "", false},
+	}
+	for _, c := range cases {
+		tbl, err := in.Table(t.Context(), c.table)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := tbl.RowKey(); got.Name != c.want || ok != c.wantOK {
+			t.Errorf("%s: RowKey() = %q, %v; want %q, %v", c.table, got.Name, ok, c.want, c.wantOK)
+		}
+	}
+}
+
+func TestAffinity(t *testing.T) {
+	cases := map[string]schema.Affinity{
+		"INTEGER":          schema.AffinityInteger,
+		"TINYINT":          schema.AffinityInteger,
+		"VARCHAR(255)":     schema.AffinityText,
+		"CLOB":             schema.AffinityText,
+		"":                 schema.AffinityBlob,
+		"BLOB":             schema.AffinityBlob,
+		"DOUBLE PRECISION": schema.AffinityReal,
+		"FLOATING POINT":   schema.AffinityInteger,
+		"DECIMAL(10,5)":    schema.AffinityNumeric,
+		"BOOLEAN":          schema.AffinityNumeric,
+		"DATETIME":         schema.AffinityNumeric,
+	}
+	for typ, want := range cases {
+		if got := (schema.Column{Type: typ}).Affinity(); got != want {
+			t.Errorf("Affinity(%q) = %v, want %v", typ, got, want)
+		}
 	}
 }

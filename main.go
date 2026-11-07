@@ -7,13 +7,9 @@ import (
 	"github.com/JayJamieson/libsql-rest/internal/cmd"
 )
 
-func run() error {
-	return cmd.Execute()
-}
-
 func main() {
-	if err := run(); err != nil {
-		fmt.Fprintf(os.Stderr, "%s\n", err)
+	if err := cmd.Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}
 }

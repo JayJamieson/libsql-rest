@@ -1,51 +1,33 @@
-// Package openapi generates an OpenAPI 3.0 description of the API from the live
-// database schema. Because the routes are schema-driven, the spec is too: each
-// exposed table/view becomes concrete paths with typed request/response models,
-// so generated client libraries get real per-table types rather than opaque
-// maps. This mirrors how PostgREST serves its own spec.
+// Package openapi builds an OpenAPI 3.0 document with typed models from the database schema.
 package openapi
 
 import (
+	"cmp"
 	"strings"
 
 	"github.com/JayJamieson/libsql-rest/internal/schema"
 )
 
-// Options controls document-level fields that are not derived from the schema.
 type Options struct {
-	Title     string
-	Version   string
-	ServerURL string
-	// AuthEnabled adds a global bearer-JWT security requirement when true.
-	AuthEnabled bool
+	Version       string
+	ServerURL     string
+	TokenRequired bool
 }
 
-// Build returns an OpenAPI 3.0 document (as a JSON-serializable map) describing
-// the given tables and views. Map keys serialize in a stable, sorted order, so
-// the output is deterministic.
 func Build(tables []schema.Table, opts Options) map[string]any {
-	if opts.Title == "" {
-		opts.Title = "libsql-rest"
-	}
-	if opts.Version == "" {
-		opts.Version = "0.1.0"
-	}
-
 	schemas := baseSchemas()
 	paths := map[string]any{
 		"/api/tables": tablesPath(),
 	}
-
 	for i := range tables {
-		t := &tables[i]
-		addTable(paths, schemas, t)
+		addTable(paths, schemas, &tables[i])
 	}
 
 	doc := map[string]any{
 		"openapi": "3.0.3",
 		"info": map[string]any{
-			"title":       opts.Title,
-			"version":     opts.Version,
+			"title":       "libsql-rest",
+			"version":     cmp.Or(opts.Version, "dev"),
 			"description": "Auto-generated from the live database schema.",
 		},
 		"paths": paths,
@@ -57,11 +39,9 @@ func Build(tables []schema.Table, opts Options) map[string]any {
 	if opts.ServerURL != "" {
 		doc["servers"] = []any{map[string]any{"url": opts.ServerURL}}
 	}
-	// Always declare the security posture. When auth is enabled a bearer token is
-	// required; when disabled, an empty requirement ({}) is added to signal that
-	// anonymous access is allowed while still accepting a (ignored) token.
+	// The empty requirement {} tells clients they may call without a token.
 	bearer := map[string]any{"bearerAuth": []any{}}
-	if opts.AuthEnabled {
+	if opts.TokenRequired {
 		doc["security"] = []any{bearer}
 	} else {
 		doc["security"] = []any{map[string]any{}, bearer}
@@ -69,30 +49,22 @@ func Build(tables []schema.Table, opts Options) map[string]any {
 	return doc
 }
 
-// addTable registers the paths and component schemas for a single table/view.
 func addTable(paths, schemas map[string]any, t *schema.Table) {
 	name := t.Name
-	respName := schemaName(name)
+	respName := sanitize(name)
 	inputName := respName + "Input"
 
-	schemas[respName] = rowSchema(t, true)
-	writable := t.Type == "table"
-	if writable {
-		schemas[inputName] = rowSchema(t, false)
-	}
-
-	// Collection path: list (all) and create (base tables only).
+	schemas[respName] = responseSchema(t)
 	collection := map[string]any{
 		"get": listOp(name, respName),
 	}
-	if writable {
+	if !t.IsView() {
+		schemas[inputName] = inputSchema(t)
 		collection["post"] = createOp(name, respName, inputName)
 	}
 	paths["/api/"+name] = collection
 
-	// Item path: only when a single-row key exists. Views have no rowid and
-	// composite-key tables cannot be addressed by a single path value.
-	if writable && len(t.PrimaryKey()) <= 1 {
+	if _, ok := t.RowKey(); ok {
 		item := map[string]any{
 			"parameters": []any{pkParam()},
 			"get":        getOp(name, respName),
@@ -105,7 +77,7 @@ func addTable(paths, schemas map[string]any, t *schema.Table) {
 
 func listOp(table, respName string) map[string]any {
 	return map[string]any{
-		"operationId": "list_" + operationSuffix(table),
+		"operationId": "list_" + sanitize(table),
 		"summary":     "List rows from " + table,
 		"description": "PostgREST-style filters: any `column=op.value` query pair " +
 			"(op: eq,neq,gt,gte,lt,lte,like,ilike,in,is; prefix `not.` to negate).",
@@ -123,7 +95,7 @@ func listOp(table, respName string) map[string]any {
 
 func createOp(table, respName, inputName string) map[string]any {
 	return map[string]any{
-		"operationId": "create_" + operationSuffix(table),
+		"operationId": "create_" + sanitize(table),
 		"summary":     "Create a row in " + table,
 		"tags":        []any{table},
 		"requestBody": bodyRef(inputName),
@@ -132,6 +104,7 @@ func createOp(table, respName, inputName string) map[string]any {
 			"400": errorRef("Bad request"),
 			"401": errorRef("Unauthorized"),
 			"404": errorRef("Not found"),
+			"413": errorRef("Payload too large"),
 			"500": errorRef("Server error"),
 		},
 	}
@@ -139,7 +112,7 @@ func createOp(table, respName, inputName string) map[string]any {
 
 func getOp(table, respName string) map[string]any {
 	return map[string]any{
-		"operationId": "get_" + operationSuffix(table),
+		"operationId": "get_" + sanitize(table),
 		"summary":     "Fetch a row from " + table + " by primary key",
 		"tags":        []any{table},
 		"responses": map[string]any{
@@ -153,7 +126,7 @@ func getOp(table, respName string) map[string]any {
 
 func updateOp(table, respName, inputName string) map[string]any {
 	return map[string]any{
-		"operationId": "update_" + operationSuffix(table),
+		"operationId": "update_" + sanitize(table),
 		"summary":     "Update a row in " + table + " by primary key",
 		"tags":        []any{table},
 		"requestBody": bodyRef(inputName),
@@ -162,6 +135,7 @@ func updateOp(table, respName, inputName string) map[string]any {
 			"400": errorRef("Bad request"),
 			"401": errorRef("Unauthorized"),
 			"404": errorRef("Not found"),
+			"413": errorRef("Payload too large"),
 			"500": errorRef("Server error"),
 		},
 	}
@@ -169,7 +143,7 @@ func updateOp(table, respName, inputName string) map[string]any {
 
 func deleteOp(table string) map[string]any {
 	return map[string]any{
-		"operationId": "delete_" + operationSuffix(table),
+		"operationId": "delete_" + sanitize(table),
 		"summary":     "Delete a row from " + table + " by primary key",
 		"tags":        []any{table},
 		"responses": map[string]any{
@@ -181,36 +155,35 @@ func deleteOp(table string) map[string]any {
 	}
 }
 
-// rowSchema builds the object schema for a table's row. When response is true,
-// every column is marked required (a returned row always includes them);
-// otherwise no field is required so the schema suits both create and partial
-// update (the server enforces NOT NULL constraints).
-func rowSchema(t *schema.Table, response bool) map[string]any {
-	props := map[string]any{}
-	var required []any
-	for _, c := range t.Columns {
-		props[c.Name] = columnSchema(c)
-		if response {
-			required = append(required, c.Name)
-		}
-	}
-	s := map[string]any{
-		"type":       "object",
-		"properties": props,
-	}
-	if len(required) > 0 {
-		s["required"] = required
-	}
-	if !response {
-		s["description"] = "Columns are optional here; the database enforces NOT NULL and defaults."
-	}
+func responseSchema(t *schema.Table) map[string]any {
+	s := rowSchema(t)
+	s["required"] = t.ColumnNames()
 	return s
 }
 
-// columnSchema maps a column's declared SQLite type to an OpenAPI schema.
+func inputSchema(t *schema.Table) map[string]any {
+	s := rowSchema(t)
+	s["description"] = "Every column is optional. The database applies defaults and enforces NOT NULL."
+	return s
+}
+
+func rowSchema(t *schema.Table) map[string]any {
+	props := map[string]any{}
+	for _, c := range t.Columns {
+		props[c.Name] = columnSchema(c)
+	}
+	return map[string]any{
+		"type":       "object",
+		"properties": props,
+	}
+}
+
 func columnSchema(c schema.Column) map[string]any {
-	typ, format := sqlTypeToOpenAPI(c.Type)
-	s := map[string]any{"type": typ}
+	s := map[string]any{}
+	typ, format := columnType(c)
+	if typ != "" {
+		s["type"] = typ
+	}
 	if format != "" {
 		s["format"] = format
 	}
@@ -220,33 +193,35 @@ func columnSchema(c schema.Column) map[string]any {
 	return s
 }
 
-// sqlTypeToOpenAPI approximates SQLite type-affinity rules, plus a few common
-// conveniences (BOOL, DATE/TIME), to pick an OpenAPI type and format.
-func sqlTypeToOpenAPI(declared string) (typ, format string) {
-	d := strings.ToUpper(strings.TrimSpace(declared))
-	switch {
-	case d == "":
-		return "string", ""
-	case strings.Contains(d, "INT"):
+// columnType follows the column's SQLite affinity. Within NUMERIC affinity,
+// BOOL columns hold 0 and 1, so they are integers. A column with no declared
+// type can hold any value, so it gets no type.
+func columnType(c schema.Column) (typ, format string) {
+	declared := strings.ToUpper(c.Type)
+	switch c.Affinity() {
+	case schema.AffinityInteger:
 		return "integer", ""
-	case strings.Contains(d, "BOOL"):
-		return "boolean", ""
-	case strings.Contains(d, "CHAR"), strings.Contains(d, "CLOB"), strings.Contains(d, "TEXT"):
+	case schema.AffinityText:
 		return "string", ""
-	case strings.Contains(d, "BLOB"):
-		return "string", "byte"
-	case strings.Contains(d, "REAL"), strings.Contains(d, "FLOA"), strings.Contains(d, "DOUB"):
+	case schema.AffinityReal:
 		return "number", "double"
-	case strings.Contains(d, "DATE"), strings.Contains(d, "TIME"):
+	case schema.AffinityBlob:
+		if declared == "" {
+			return "", ""
+		}
+		return "string", "byte"
+	}
+	switch {
+	case strings.Contains(declared, "BOOL"):
+		return "integer", ""
+	case strings.Contains(declared, "DATE"), strings.Contains(declared, "TIME"):
 		return "string", "date-time"
-	case strings.Contains(d, "NUMERIC"), strings.Contains(d, "DECIMAL"):
+	case strings.Contains(declared, "NUMERIC"), strings.Contains(declared, "DECIMAL"):
 		return "number", ""
 	default:
-		return "string", ""
+		return "", ""
 	}
 }
-
-// --- shared fragments ---
 
 func tablesPath() map[string]any {
 	return map[string]any{
@@ -378,17 +353,6 @@ func securitySchemes() map[string]any {
 	}
 }
 
-// schemaName sanitizes a table name into a valid component schema key.
-func schemaName(table string) string {
-	return sanitize(table)
-}
-
-// operationSuffix sanitizes a table name for use in an operationId.
-func operationSuffix(table string) string {
-	return sanitize(table)
-}
-
-// sanitize replaces characters that are awkward in identifiers/refs with "_".
 func sanitize(s string) string {
 	var b strings.Builder
 	for _, r := range s {
@@ -403,7 +367,6 @@ func sanitize(s string) string {
 	if out == "" {
 		return "t"
 	}
-	// Component names must not start with a digit for some generators.
 	if out[0] >= '0' && out[0] <= '9' {
 		return "t_" + out
 	}
