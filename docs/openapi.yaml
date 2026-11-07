@@ -2,21 +2,21 @@ openapi: 3.0.3
 info:
   title: libsql-rest
   description: >
-    REST API exposing libSQL/Turso (or SQLite) tables and views, PostgREST-style.
+    REST API over the tables and views of a libSQL or SQLite database.
 
 
-    The paths are generic: `{table}` is any exposed table or view and `{pk}` is a
-    row's primary key. Row bodies are open objects because their columns depend
-    on your database schema — see the note in the README on generating a
-    schema-aware spec with concrete per-table models.
-  version: 0.1.0
+    This spec is generic. `{table}` is any exposed table or view, and `{pk}` is a
+    row's primary key. Rows are open objects because their columns depend on the
+    database. A running server serves a spec with a typed model per table at
+    `/openapi.json`.
+  version: 1.0.0
   license:
     name: MIT
 servers:
   - url: http://localhost:8080
     description: Local server
 
-# Applied globally, but only enforced when the server runs with auth enabled.
+# The server enforces this only when auth is enabled.
 security:
   - bearerAuth: []
 
@@ -47,10 +47,10 @@ paths:
       operationId: listRows
       summary: List rows from a table or view
       description: >
-        Supports PostgREST-style horizontal filtering. Besides the reserved
-        parameters below, any `column=op.value` pair filters rows, where `op` is
-        one of eq, neq, gt, gte, lt, lte, like, ilike, in, is (prefix with `not.`
-        to negate). Example: `?age=gte.18&name=like.jo*&status=not.eq.archived`.
+        Any query parameter other than select, order, limit, and offset is a
+        filter of the form `column=op.value`. `op` is one of eq, neq, gt, gte,
+        lt, lte, like, ilike, in, or is. Put `not.` before it to negate it.
+        Example: `?age=gte.18&name=like.jo*&status=not.eq.archived`.
       tags: [rows]
       parameters:
         - $ref: "#/components/parameters/Select"
@@ -61,8 +61,8 @@ paths:
           in: query
           required: false
           description: >
-            Dynamic per-column filters expressed as `column=op.value`. Modeled as
-            a free-form map so generated clients can pass arbitrary column filters.
+            Column filters as `column=op.value`. This is a free-form map so that
+            generated clients can pass a filter on any column.
           style: form
           explode: true
           schema:
@@ -98,7 +98,7 @@ paths:
               $ref: "#/components/schemas/Row"
       responses:
         "201":
-          description: The created row, including database-assigned defaults
+          description: The created row, with database defaults filled in
           content:
             application/json:
               schema:
@@ -109,6 +109,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/ServerError"
 
@@ -127,6 +131,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Row"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -156,6 +162,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
         "500":
           $ref: "#/components/responses/ServerError"
     delete:
@@ -165,6 +175,8 @@ paths:
       responses:
         "204":
           description: The row was deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -179,8 +191,8 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: >
-        JWT bearer token. Required on every endpoint when the server runs with
-        authentication enabled; ignored when it does not.
+        JWT bearer token. Every endpoint requires it when the server runs with
+        auth enabled. Otherwise the server ignores it.
 
   parameters:
     Table:
@@ -201,7 +213,7 @@ components:
       name: select
       in: query
       required: false
-      description: Comma-separated list of columns to return (projection)
+      description: Comma-separated columns to return
       schema:
         type: string
       example: id,name
@@ -218,7 +230,7 @@ components:
       name: limit
       in: query
       required: false
-      description: Maximum rows to return (capped by the server's max_page_size)
+      description: Maximum rows to return. Defaults to the server's max_page_size and cannot exceed it.
       schema:
         type: integer
         minimum: 0
@@ -244,8 +256,8 @@ components:
     Row:
       type: object
       description: >
-        A database row. Properties are dynamic (they depend on the table's
-        columns), so this is an open object.
+        A database row. Its properties are the table's columns, so this is an
+        open object.
       additionalProperties: true
     Error:
       type: object
@@ -256,7 +268,10 @@ components:
 
   responses:
     BadRequest:
-      description: Invalid request (unknown column, bad operator, malformed body)
+      description: >
+        Unknown column or operator, malformed query string or body, write to a
+        view, a `{pk}` route on a table without a single-column primary key, or
+        a NOT NULL, CHECK, or type constraint failure
       content:
         application/json:
           schema:
@@ -268,7 +283,19 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     NotFound:
-      description: Table/view or row not found (also returned for disallowed tables)
+      description: No such table, view, or row. Tables hidden by allow_tables also return 404.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: UNIQUE, PRIMARY KEY, or FOREIGN KEY constraint failure
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    PayloadTooLarge:
+      description: Request body larger than 1 MiB
       content:
         application/json:
           schema:

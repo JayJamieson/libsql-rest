@@ -1,12 +1,8 @@
 # Request flow
 
-How an HTTP request travels through libsql-rest, from the socket to SQLite/libsql
-and back. Every request passes through the same middleware and layering; the
-endpoint only changes which handler and which `Store` method run.
+This page follows an HTTP request through libsql-rest, from the socket to the database and back. Every request passes through the same middleware and layers. The endpoint decides only which handler and which `Store` method run.
 
-Rendered images (for viewers without Mermaid support):
-[layers](images/request-flow-layers.png) ·
-[sequence](images/request-flow-sequence.png)
+GitHub renders the Mermaid diagrams below. For other viewers, there are PNG copies of the [layers diagram](images/request-flow-layers.png) and the [sequence diagram](images/request-flow-sequence.png).
 
 ## Layers
 
@@ -38,16 +34,15 @@ flowchart LR
     resp --> client
 ```
 
-- **logRequests** is always outermost, so even `401`s are logged.
-- **JWT auth** is present only when `auth.enabled`. It validates the bearer token
-  and attaches an `*auth.Principal` to the request context (anonymous when
-  `auth.optional` and no token is supplied). This is the seam RLS will read.
-- **Store** is an interface; the SQL implementation validates every table/column
-  against the introspected schema and binds all values as `?` parameters.
+`logRequests` wraps everything else, so the log records a request even when the auth middleware rejects it with a `401`.
 
-## Request lifecycle (list with a filter)
+The JWT middleware runs only when `auth.enabled` is true. It checks the bearer token and stores an `*auth.Principal` in the request context. With `auth.optional` set, a request without a token gets an anonymous principal. Row-level security will read the principal from there.
 
-`GET /api/users?age=gte.18&order=age.desc&limit=20` with `Authorization: Bearer <jwt>`
+The handlers call the `Store` interface. `SQLStore` implements it. It looks up each table and column in the cached schema before it builds SQL, and it binds every value as a `?` parameter.
+
+## Lifecycle of a filtered list request
+
+This example follows `GET /api/users?age=gte.18&order=age.desc&limit=20` with an `Authorization: Bearer <jwt>` header.
 
 ```mermaid
 sequenceDiagram
@@ -88,39 +83,33 @@ sequenceDiagram
 
 ## Endpoint reference
 
-| Method & path | Handler | Store call | Success | Body in | Body out |
+| Method and path | Handler | Store method | Success | Request body | Response body |
 | --- | --- | --- | --- | --- | --- |
-| `GET /openapi.json` | `OpenAPI` | `Schema` | `200` | – | OpenAPI 3.0 document |
-| `GET /api/tables` | `ListTables` | `Tables` | `200` | – | `[{name,type}]` |
-| `GET /api/{table}` | `ListRows` | `List` | `200` | – | `[{...row}]` |
-| `GET /api/{table}/{pk}` | `GetRow` | `Get` | `200` | – | `{...row}` |
-| `POST /api/{table}` | `CreateRow` | `Insert` | `201` | `{...row}` | `{...row}` (with defaults) |
-| `PATCH /api/{table}/{pk}` | `UpdateRow` | `Update` | `200` | `{...partial}` | `{...row}` |
-| `DELETE /api/{table}/{pk}` | `DeleteRow` | `Delete` | `204` | – | – |
+| `GET /openapi.json` | `OpenAPI` | `Tables` | `200` | None | OpenAPI 3.0 document |
+| `GET /api/tables` | `ListTables` | `Tables` | `200` | None | `[{name, type}]` |
+| `GET /api/{table}` | `ListRows` | `List` | `200` | None | Array of rows |
+| `GET /api/{table}/{pk}` | `GetRow` | `Get` | `200` | None | Row |
+| `POST /api/{table}` | `CreateRow` | `Insert` | `201` | Row | Row with defaults filled in |
+| `PATCH /api/{table}/{pk}` | `UpdateRow` | `Update` | `200` | Some columns of a row | Updated row |
+| `DELETE /api/{table}/{pk}` | `DeleteRow` | `Delete` | `204` | None | None |
 
-`{table}` accepts any exposed table or view; `{pk}` is matched against the
-table's single-column primary key (falling back to `rowid`).
-
-### List query parameters (`GET /api/{table}`)
-
-- Filters: `column=op.value` (`eq,neq,gt,gte,lt,lte,like,ilike,in,is`), `not.` to negate
-- `select=col1,col2` — projection
-- `order=col.asc,col2.desc[.nullsfirst|.nullslast]`
-- `limit` / `offset` — paging (`limit` capped by `max_page_size`)
+`{table}` is any exposed table or view. `schema.Table.RowKey` decides which column `{pk}` matches. It returns the primary key when the key is a single column. A view, a table without a primary key, and a table with a composite key have no row key, so their `{pk}` routes return `400`. The OpenAPI document uses the same rule to decide which tables get item paths.
 
 ## Error mapping
 
-Every error is a `{"error": "message"}` envelope. The status is derived centrally
-in `writeStoreError`:
+Every error a handler returns has the body `{"error": "message"}`. `writeError` in `internal/server/response.go` picks the status from a table of sentinel errors. `SQLStore` wraps SQLite constraint failures in `store.ErrConflict` or `store.ErrConstraint`, and matches on SQLite's message text because the libsql driver reports no error code.
 
 ```mermaid
 flowchart TD
-    err[error from parse/store] --> k{kind}
+    err[error from decodeRow, query, or store] --> k{errors.Is}
     k -->|schema.ErrTableNotFound<br/>store.ErrRowNotFound| c404[404 Not Found]
-    k -->|query.ErrInvalidRequest<br/>store.ErrCompositePrimaryKey| c400[400 Bad Request]
-    k -->|JWT invalid/missing| c401[401 Unauthorized]
-    k -->|anything else| c500[500 Internal<br/>logged, generic message]
+    k -->|query.ErrInvalidRequest<br/>store.ErrNoRowKey<br/>store.ErrReadOnly<br/>store.ErrConstraint<br/>errInvalidBody| c400[400 Bad Request]
+    k -->|store.ErrConflict| c409[409 Conflict]
+    k -->|errBodyTooLarge| c413[413 Content Too Large]
+    k -->|anything else| c500[500 Internal Server Error<br/>logged, generic message]
+    jwt[JWT missing or invalid] --> c401[401 Unauthorized]
 ```
 
-Disallowed tables (outside `allow_tables`) are reported as `404`, so the allow
-list never leaks the existence of hidden tables.
+The JWT middleware writes its own `401` before the request reaches a handler. `ServeMux` answers an unknown path or an unsupported method with a plain-text `404` or `405`.
+
+A table outside `allow_tables` returns `404`, the same as a table that does not exist. A client cannot use the allow list to find out which tables exist.

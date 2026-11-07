@@ -1,255 +1,233 @@
 # libsql-rest
 
-Expose libSQL (Turso) tables over HTTP as a "RESTful" API. The concept is the
-same as [pRESTd](https://prestd.com/) or [PostgREST](https://postgrest.org/):
-point it at a database and get CRUD endpoints for every table and view without
-writing any handler code.
+libsql-rest serves the tables and views of a libSQL or SQLite database as a REST API. Point it at a database and every table gets CRUD endpoints, with no handler code to write. The idea is the same as [PostgREST](https://postgrest.org/) and [pRESTd](https://prestd.com/).
 
-It can also run against a plain SQLite file (via a pure-Go driver), which is
-handy for local development and tests. Switching between SQLite and libsql is a
-single configuration change.
+It connects to a libSQL server such as [Turso](https://turso.tech/), or opens a local SQLite file with a pure-Go driver. One setting switches between the two.
 
-## Features
+## Install
 
-- CRUD over every table/view
-  - `GET /api/tables` — list tables and views
-  - `GET /api/{table}` — list rows (with filtering, ordering, paging)
-  - `GET /api/{table}/{pk}` — fetch one row by primary key
-  - `POST /api/{table}` — create a row
-  - `PATCH /api/{table}/{pk}` — update a row
-  - `DELETE /api/{table}/{pk}` — delete a row
-- PostgREST-style horizontal filtering on the list endpoint
-- Schema-aware OpenAPI 3.0 spec served at `/openapi.json` for typed client generation
-- JWT authentication (RS256 or HMAC), with a current-user seam for future row-level security
-- Table/view allow list
-- Parameterized queries with schema-validated identifiers (no SQL injection)
-- SQLite or libsql/Turso backend, selectable by config
+```sh
+go install github.com/JayJamieson/libsql-rest@latest
+```
 
-See [`docs/request-flow.md`](docs/request-flow.md) for how a request is processed
-and [`docs/openapi.yaml`](docs/openapi.yaml) for the API description (see
-[API clients](#api-clients) below).
+You need Go 1.25 or later. Run `libsql-rest --version` to check the build.
 
-## Querying
+## Quick start
 
-Filters are expressed as `?column=operator.value` and combined with `AND`:
+Create a database with one table, then start the server:
+
+```sh
+sqlite3 app.db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INT)"
+libsql-rest serve --uri file:app.db
+```
+
+In another terminal, add a row and query it:
+
+```sh
+curl -X POST localhost:8080/api/users -d '{"name": "ada", "age": 36}'
+curl 'localhost:8080/api/users?age=gte.18'
+```
+
+The second command prints `[{"age":36,"id":1,"name":"ada"}]`.
+
+## Endpoints
+
+| Method and path | Action | Success |
+| --- | --- | --- |
+| `GET /api/tables` | List the exposed tables and views | `200` |
+| `GET /api/{table}` | List rows, with filters, ordering, and paging | `200` |
+| `GET /api/{table}/{pk}` | Return one row by primary key | `200` |
+| `POST /api/{table}` | Insert a row and return it with database defaults filled in | `201` |
+| `PATCH /api/{table}/{pk}` | Update the given columns and return the row | `200` |
+| `DELETE /api/{table}/{pk}` | Delete a row | `204` |
+| `GET /openapi.json` | Return an OpenAPI 3.0 document built from the schema | `200` |
+
+`{pk}` is a value of the table's primary key. The `{pk}` routes need a single-column primary key, so views, tables without a primary key, and tables with a composite key have only the list route. Views are also read-only.
+
+A request body is one JSON object of column values, up to 1 MiB. Integers keep full 64-bit precision. The server rejects nested objects and arrays.
+
+Every error from these endpoints has the body `{"error": "message"}`:
+
+| Status | Cause |
+| --- | --- |
+| `400` | An unknown column or operator, a malformed query string or body, a write to a view, a `{pk}` route on a table without a single-column key, or a NOT NULL, CHECK, or type constraint failure |
+| `401` | A missing or invalid token, when auth is on |
+| `404` | An unknown table, a table that `allow_tables` hides, or no row with that key |
+| `409` | A UNIQUE, PRIMARY KEY, or FOREIGN KEY constraint failure |
+| `413` | A body larger than 1 MiB |
+| `500` | Any other error. The server logs the detail and returns a generic message. |
+
+A path that matches no endpoint, or a method an endpoint does not support, gets the plain-text `404` or `405` from Go's `net/http`.
+
+## Filter, sort, and page
+
+The list endpoint takes PostgREST-style query parameters:
 
 ```
 GET /api/users?age=gte.18&name=like.jo*&order=age.desc&limit=20&offset=40&select=id,name
 ```
 
-| Operator | Meaning              | Example                 |
-| -------- | -------------------- | ----------------------- |
-| `eq`     | equal                | `status=eq.active`      |
-| `neq`    | not equal            | `status=neq.active`     |
-| `gt/gte` | greater (or equal)   | `age=gte.18`            |
-| `lt/lte` | less (or equal)      | `age=lt.65`             |
-| `like`   | pattern (`*` = `%`)  | `name=like.jo*`         |
-| `ilike`  | case-insensitive     | `name=ilike.JO*`        |
-| `in`     | in list              | `id=in.(1,2,3)`         |
-| `is`     | null / true / false  | `deleted_at=is.null`    |
+Each filter has the form `column=operator.value`. Filters combine with `AND`, and a column can appear more than once.
 
-Prefix any operator with `not.` to negate it, e.g. `status=not.eq.active`.
+| Operator | Meaning | Example |
+| --- | --- | --- |
+| `eq`, `neq` | Equal, not equal | `status=eq.active` |
+| `gt`, `gte` | Greater than, greater than or equal | `age=gte.18` |
+| `lt`, `lte` | Less than, less than or equal | `age=lt.65` |
+| `like`, `ilike` | Pattern match with `*` as the wildcard | `name=like.jo*` |
+| `in` | Value is in the list | `id=in.(1,2,3)` |
+| `is` | Value is `null`, `true`, or `false` | `deleted_at=is.null` |
 
-Response shaping:
+Put `not.` before an operator to negate it, as in `status=not.eq.active`. SQLite's `LIKE` ignores case for ASCII letters, so `like` and `ilike` return the same rows.
 
-- `select=col1,col2` — restrict returned columns
-- `order=col.asc,col2.desc[.nullsfirst|.nullslast]` — ordering
-- `limit` / `offset` — pagination (`limit` is capped by `max_page_size`)
+These parameters shape the response:
 
-## Configuration
+- `select=id,name` returns only the listed columns.
+- `order=age.desc,name.asc` sorts the rows. Add `.nullsfirst` or `.nullslast` to a term to control where NULLs go.
+- `limit` and `offset` page through the rows. `limit` defaults to `max_page_size` and cannot exceed it.
 
-Create `$HOME/.libsql-rest.yaml` (or pass `--config`):
+## Configure
+
+The server reads each setting from the first source that has it: a flag, an environment variable, the config file, then the default. The config file is `$HOME/.libsql-rest.yaml`, or the path you pass with `--config`.
 
 ```yaml
 server:
-  host: "127.0.0.1"
+  host: ""          # empty binds all interfaces
   port: 8080
   max_page_size: 100
 
 db:
-  # driver: sqlite (default) or libsql
-  driver: libsql
-  uri: "http://127.0.0.1:8080"
-  token: "" # libsql auth token; ignored by the sqlite driver
+  driver: libsql    # sqlite (default) or libsql
+  uri: http://127.0.0.1:8080
+  token: ""         # libsql auth token, ignored by the sqlite driver
 
-# Optional: restrict the API to these tables/views. Omit to expose all.
+# Expose only these tables and views. Leave it out to expose all of them.
 allow_tables:
   - users
   - posts
 
 auth:
   enabled: true
-  algorithm: RS256 # RS256 (recommended) or HS256/384/512
-  # For RS* — path to the PEM public key used to verify tokens:
-  public_key_path: jwt-public.pem
-  # For HS* — the shared HMAC secret instead:
-  # algorithm: HS256
-  # secret: "change-me"
-  issuer: libsql-rest # validated against the token `iss`
-  audience: libsql-rest # validated against the token `aud`
-  optional: false # when true, allow anonymous requests through (see RLS below)
+  algorithm: RS256  # HS256 (default), HS384, HS512, RS256, RS384, or RS512
+  public_key_path: jwt-public.pem  # for RS* algorithms
+  # secret: change-me              # for HS* algorithms
+  issuer: libsql-rest    # required iss claim
+  audience: libsql-rest  # required aud claim
+  optional: false   # true lets requests without a token through
 ```
 
-Every value can also be set with a flag or environment variable. Flags:
+Every key has an environment variable. Its name is `LIBSQL_REST_` plus the key in upper case, with each dot replaced by an underscore. For example, `db.uri` is `LIBSQL_REST_DB_URI`, and `allow_tables` is `LIBSQL_REST_ALLOW_TABLES=users,posts`. Put secrets such as `db.token` and `auth.secret` in the environment, so they stay out of shell history and process listings.
 
+Every key also has a flag. Run `libsql-rest serve --help` to see them.
+
+```sh
+libsql-rest serve --uri file:app.db --port 8080
+LIBSQL_REST_DB_TOKEN="$TURSO_TOKEN" libsql-rest serve --driver libsql --uri libsql://mydb.turso.io
 ```
-libsql-rest serve --driver sqlite --uri file:libsql.db --port 8080 --host 127.0.0.1
-libsql-rest serve --driver libsql --uri http://127.0.0.1:8080 --token "$TURSO_TOKEN"
-libsql-rest serve --driver sqlite --uri file:libsql.db --auth --auth-secret "$JWT_SECRET"
-```
+
+The server reads the schema on the first request that needs it and keeps it in memory. Restart the server after you create, drop, or alter a table.
+
+With the sqlite driver, a request waits up to 5 seconds for another request's write to finish. To change the wait, add `_pragma=busy_timeout(ms)` to the URI, as in `file:app.db?_pragma=busy_timeout(10000)`.
 
 ## Authentication
 
-JWT authentication is handled by [Auth0's battle-tested
-`go-jwt-middleware`](https://github.com/auth0/go-jwt-middleware). When
-`auth.enabled` is set, every API request must carry a valid bearer token:
+When `auth.enabled` is true, every request needs a bearer token:
 
 ```
 Authorization: Bearer <jwt>
 ```
 
-Tokens are validated for signature, expiry, and the configured issuer/audience.
-Invalid or missing tokens get a `401` with the standard `{"error": "..."}`
-envelope. Two signing schemes are supported:
+[go-jwt-middleware](https://github.com/auth0/go-jwt-middleware) checks the token's signature, expiry, issuer, and audience. A token without an `exp` claim fails. The server accepts only the configured algorithm and rejects a token whose header names any other. That blocks the attack where someone signs an HS256 token with the server's RSA public key as the secret.
 
-- **RS256 (recommended for production)** — asymmetric. The server holds only the
-  RSA **public key** and can verify tokens without being able to mint them, so
-  the signing key never has to live on the API server.
-- **HS256/384/512** — symmetric shared secret. Simplest for local development,
-  but the same key both signs and verifies.
+Use an RS* algorithm in production. The server then holds only the public key, so an attacker who compromises the server still cannot mint tokens. HS* algorithms sign and verify with one shared secret, which is simpler for local development.
 
-The expected algorithm is pinned, so a token advertising a different algorithm
-in its header is rejected (this defeats RSA/HMAC algorithm-confusion attacks).
-
-### RS256 (public key)
+### RS256
 
 ```sh
-# 1. Generate a key pair (jwt-private.pem 0600, jwt-public.pem 0644)
+# Writes jwt-private.pem (mode 0600) and jwt-public.pem. Existing files are never overwritten.
 libsql-rest keygen
 
-# 2. Run the server verifying with the public key only
-libsql-rest serve --driver sqlite --uri file:libsql.db \
-  --auth --auth-algorithm RS256 --auth-public-key jwt-public.pem
+libsql-rest serve --uri file:app.db --auth --auth-algorithm RS256 --auth-public-key jwt-public.pem
 
-# 3. Mint a dev token with the private key
-libsql-rest token --algorithm RS256 --private-key jwt-private.pem \
-  --subject alice --claim role=admin
+libsql-rest token --algorithm RS256 --private-key jwt-private.pem --subject alice --claim role=admin
 ```
 
-In production the private key lives with your identity provider (or a separate
-signing service); the server only ever sees `jwt-public.pem`.
+In production, your identity provider keeps the private key and the server reads only `jwt-public.pem`.
 
-### HS256 (shared secret)
+### HS256
 
 ```sh
-libsql-rest serve --driver sqlite --uri file:libsql.db --auth --auth-secret "$JWT_SECRET"
-libsql-rest token --secret "$JWT_SECRET" --subject alice --claim role=admin
+export LIBSQL_REST_AUTH_SECRET="$(openssl rand -hex 32)"
+libsql-rest serve --uri file:app.db --auth
+libsql-rest token --subject alice
 ```
 
-The `--subject` flag sets the `sub` claim — the **user id** that row-level
-security keys off (reachable as `auth.FromContext(ctx).UserID()`). Additional
-`--claim key=value` flags (e.g. `role=admin`, `tenant=acme`) are carried through
-verbatim and exposed on the principal for rules to reference.
+Without `--secret`, `token` reads the secret from `LIBSQL_REST_AUTH_SECRET`, the same variable the server reads.
 
-Set `auth.optional: true` to let requests without a token through as an
-anonymous principal (a present-but-invalid token is still rejected). This is the
-mode row-level security will build on.
+`--subject` sets the `sub` claim, which identifies the user. Each `--claim key=value` adds one more claim, and the server keeps every claim on the request's principal.
+
+Set `auth.optional` to let a request without a token through as an anonymous caller. A request with an invalid token still gets a `401`.
 
 ## Row-level security (planned)
 
-RLS is not implemented yet, but the authentication layer is built as its seam.
-Every request carries a `*auth.Principal` in its context (`auth.FromContext`),
-exposing the user id (`UserID()`, the `sub` claim) and all token claims
-(`Claim`/`ClaimString`), and it is reachable from both the handlers and the
-store without any signature changes.
+Row-level security does not exist yet. The pieces it needs are in place: the auth middleware stores an `*auth.Principal` in each request context, and `auth.FromContext` returns it with the `sub` claim and every other claim.
 
-The intended design follows [PocketBase's collection
-rules](https://pocketbase.io/docs/api-rules-and-filters/): each table/view gets
-optional per-operation rule expressions (list/view/create/update/delete)
-evaluated against the request and the current principal (e.g. `@request.auth.id`).
-A non-empty rule compiles to an extra `WHERE` predicate that the query builder
-ANDs into the generated SQL — reusing the same parameterized-condition machinery
-that powers horizontal filtering — so access control is enforced in the database
-query rather than in application code.
+The design follows [PocketBase's API rules](https://pocketbase.io/docs/api-rules-and-filters/). Each table gets an optional rule per operation, such as `@request.auth.id = owner_id`. The query builder compiles the rule into one more parameterized `WHERE` condition, so the database enforces access instead of handler code.
 
-## API clients
+## Generate a client
 
-The server generates a **schema-aware** OpenAPI 3.0 description at runtime and
-serves it at `GET /openapi.json`. Because it is built from the live database via
-the `schema` introspector, each table/view becomes concrete paths with **typed
-per-table request/response models** (this is how PostgREST serves its spec). The
-server URL, table allow list, and auth requirement are all reflected in the
-output.
+`GET /openapi.json` describes the live schema. Each table and view gets its own paths and typed row models, the way PostgREST serves its spec. The document leaves out tables that `allow_tables` hides. It marks the bearer token as required when auth is on and `auth.optional` is false.
 
 ```sh
-# Fetch the live spec (add a bearer token if auth is enabled)
-curl http://localhost:8080/openapi.json > openapi.json
+curl localhost:8080/openapi.json > openapi.json
 
-# Go client + types (oapi-codegen)
+# Go types and client
 go run github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@latest \
-  -generate types,client -package client -o client.gen.go openapi.json
+	-generate types,client -package client -o client.gen.go openapi.json
 
-# TypeScript client (orval)
+# TypeScript client
 npx orval --input openapi.json --output ./src/api.ts
 ```
 
-Both [oapi-codegen](https://github.com/oapi-codegen/oapi-codegen) and
-[orval](https://orval.dev/) consume the spec and emit typed per-table models
-(e.g. a Go `Users`/`UsersInput` struct, a TS `Users` interface).
+For a `users` table, oapi-codegen generates a `Users` struct for rows and a `UsersInput` struct for request bodies. Column types map to OpenAPI types by SQLite type affinity, and nullable columns are marked `nullable`. A `BOOLEAN` column is an integer, because SQLite stores booleans as 0 and 1. A column with no declared type, such as a computed view column, has no OpenAPI type.
 
-Views and composite-key tables get list/read paths only; base tables with a
-single-column (or `rowid`) key get full CRUD. Columns map to OpenAPI types by
-SQLite affinity, and nullable columns are marked `nullable`.
+[`docs/openapi.yaml`](docs/openapi.yaml) is a static spec of the same endpoints with untyped rows. Use it to generate a client without a running server.
 
-A hand-written, database-independent spec also lives at
-[`docs/openapi.yaml`](docs/openapi.yaml). It describes the same endpoints with
-open (untyped) row objects and is handy for generating a client without a
-running server; the live endpoint is the source of truth for typed models.
+## Known limitations
 
-## Hacking
+- The sqlite driver returns `DATE`, `DATETIME`, and `TIMESTAMP` columns as RFC 3339 timestamps. The libsql driver returns the stored text.
+- The API returns `BLOB` values as base64 strings. Writing that string back stores text, not the original bytes.
+- A table named `tables` has no list route, because `GET /api/tables` lists the tables.
+- Two tables whose names differ only in characters other than letters, digits, and underscores, such as `a-b` and `a_b`, share one model name in the OpenAPI document. So does a table named `Error` or `Table` with the built-in models.
 
-Requirements: Go 1.22+ (developed on 1.25). `turso-cli` only if you want to run
-against a local libsql server.
+## Develop
 
-Run against a SQLite file (no extra services needed):
+You need Go 1.25 or later. To run against a local libSQL server, you also need the [Turso CLI](https://docs.turso.tech/cli/introduction).
 
 ```sh
-sqlite3 libsql.db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INT);"
-go run ./cmd serve --driver sqlite --uri file:libsql.db --port 8080
+go test ./...                     # in-memory SQLite, no services needed
+go run . serve --uri file:app.db
+
+turso dev --db-file app.db        # libSQL server on port 8080
+go run . serve --driver libsql --uri http://127.0.0.1:8080 --port 8081
 ```
 
-Run against a local libsql server:
+[`docs/request-flow.md`](docs/request-flow.md) follows one request through the code.
 
-```sh
-turso dev --db-file libsql.db          # starts sqld on :8080
-go run ./cmd serve --driver libsql --uri http://127.0.0.1:8080 --port 8081
-```
+| Package | Contents |
+| --- | --- |
+| `internal/cmd` | The `serve`, `token`, and `keygen` commands, and config loading |
+| `internal/config` | Settings, defaults, and validation |
+| `internal/db` | Opens the sqlite or libsql driver |
+| `internal/schema` | Reads tables, columns, and keys from the database |
+| `internal/query` | Parses list parameters and builds parameterized SQL |
+| `internal/store` | Runs CRUD statements and applies the allow list |
+| `internal/auth` | The JWT middleware and the request principal |
+| `internal/openapi` | Builds the OpenAPI document |
+| `internal/server` | Routes, handlers, JSON responses, and request logging |
 
-Run the tests (they use an in-memory SQLite database, no services required):
+The query builder binds every value as a parameter. It writes a table or column name into SQL only after it finds that name in the schema.
 
-```sh
-go test ./...
-```
+## License
 
-## Architecture
-
-The code is organized in layers so each piece can be tested in isolation and the
-backend can be swapped via configuration:
-
-| Package            | Responsibility                                            |
-| ------------------ | --------------------------------------------------------- |
-| `internal/config`  | Configuration, defaults, validation, table allow list     |
-| `internal/db`      | Opens `*sql.DB` for the sqlite or libsql driver            |
-| `internal/schema`  | Introspects tables/columns/PKs; validates identifiers     |
-| `internal/query`   | Parses request params; builds parameterized SQL           |
-| `internal/store`   | `Store` interface + SQL implementation (the test seam)     |
-| `internal/auth`    | JWT middleware + `Principal` context seam (for RLS)        |
-| `internal/server`  | HTTP handlers, routing, JSON responses, server lifecycle   |
-| `internal/dbscan`  | Scans rows into column-keyed maps                          |
-
-Handlers depend on the `store.Store` interface rather than a concrete database,
-so they are exercised with an in-memory SQLite store in tests. All values are
-bound as query parameters, and table/column identifiers are validated against
-the introspected schema before being interpolated, which closes the SQL
-injection holes present in the original prototype.
-```
+MIT. See [LICENSE](LICENSE).
