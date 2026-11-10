@@ -10,7 +10,7 @@ It connects to a libSQL server such as [Turso](https://turso.tech/), or opens a 
 go install github.com/JayJamieson/libsql-rest@latest
 ```
 
-You need Go 1.25 or later. Run `libsql-rest --version` to check the build.
+You need Go 1.27 or later. Run `libsql-rest --version` to check the build.
 
 ## Quick start
 
@@ -202,7 +202,7 @@ For a `users` table, oapi-codegen generates a `Users` struct for rows and a `Use
 
 ## Develop
 
-You need Go 1.25 or later. To run against a local libSQL server, you also need the [Turso CLI](https://docs.turso.tech/cli/introduction).
+You need Go 1.27 or later. To run against a local libSQL server, you also need the [Turso CLI](https://docs.turso.tech/cli/introduction).
 
 ```sh
 go test ./...                     # in-memory SQLite, no services needed

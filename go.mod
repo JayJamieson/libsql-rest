@@ -1,6 +1,6 @@
 module github.com/JayJamieson/libsql-rest
 
-go 1.25.0
+go 1.27.0
 
 require (
 	github.com/auth0/go-jwt-middleware/v2 v2.3.1

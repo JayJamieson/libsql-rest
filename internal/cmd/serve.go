@@ -99,8 +99,7 @@ func loadConfig(flags *pflag.FlagSet) (config.Config, error) {
 		v.SetConfigType("yaml")
 	}
 	if err := v.ReadInConfig(); err != nil {
-		var notFound viper.ConfigFileNotFoundError
-		if !errors.As(err, &notFound) {
+		if _, ok := errors.AsType[viper.ConfigFileNotFoundError](err); !ok {
 			return config.Config{}, fmt.Errorf("reading config file: %w", err)
 		}
 	} else {
