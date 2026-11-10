@@ -3,12 +3,15 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/JayJamieson/libsql-rest/internal/config"
 	"github.com/JayJamieson/libsql-rest/internal/query"
 	"github.com/JayJamieson/libsql-rest/internal/schema"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 type SQLStore struct {
@@ -181,38 +184,54 @@ func (s *SQLStore) queryRows(ctx context.Context, stmt query.Statement) ([]Row, 
 	return results, classify(rows.Err())
 }
 
-// sqliteErrors matches the messages the SQLite engine writes. Both drivers
-// pass them through, and libsql-client-go reports no error code to match
-// instead. SQLite also reports a duplicate primary key as a UNIQUE failure.
-var sqliteErrors = []struct {
-	text string
-	err  error
-}{
-	{"UNIQUE constraint failed", ErrConflict},
-	{"FOREIGN KEY constraint failed", ErrConflict},
-	{"NOT NULL constraint failed", ErrConstraint},
-	{"CHECK constraint failed", ErrConstraint},
-	{"datatype mismatch", ErrConstraint},
+var sqliteCodes = map[int]error{
+	sqlite3.SQLITE_CONSTRAINT_UNIQUE:     ErrConflict,
+	sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY: ErrConflict,
+	sqlite3.SQLITE_CONSTRAINT_ROWID:      ErrConflict,
+	sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY: ErrConflict,
+	sqlite3.SQLITE_CONSTRAINT_NOTNULL:    ErrConstraint,
+	sqlite3.SQLITE_CONSTRAINT_CHECK:      ErrConstraint,
+	sqlite3.SQLITE_MISMATCH:              ErrConstraint,
 }
 
-// classify wraps a constraint failure in ErrConflict or ErrConstraint. The
-// wrapped message keeps only SQLite's own text, because libsql prefixes the
-// error with the full SQL statement.
+// libsqlKinds is keyed by the text before " constraint failed" in SQLite's
+// message, because libsql-client-go drops the error code and puts the SQL
+// statement ahead of the message.
+var libsqlKinds = map[string]error{
+	"UNIQUE":            ErrConflict,
+	"FOREIGN KEY":       ErrConflict,
+	"NOT NULL":          ErrConstraint,
+	"CHECK":             ErrConstraint,
+	"datatype mismatch": ErrConstraint,
+}
+
 func classify(err error) error {
 	if err == nil {
 		return nil
 	}
-	msg := err.Error()
-	for _, e := range sqliteErrors {
-		i := strings.Index(msg, e.text)
-		if i < 0 {
-			continue
+	if e, ok := errors.AsType[*sqlite.Error](err); ok {
+		kind, ok := sqliteCodes[e.Code()]
+		if !ok {
+			return err
 		}
-		detail, _, _ := strings.Cut(msg[i:], "\n")
-		if code := strings.LastIndex(detail, " ("); code > 0 && strings.HasSuffix(detail, ")") {
-			detail = detail[:code]
+		// modernc formats "<errstr>: <errmsg> (<code>)", or "<errstr> (<code>)"
+		// when the two are equal.
+		msg := strings.TrimSuffix(e.Error(), fmt.Sprintf(" (%d)", e.Code()))
+		if _, errmsg, ok := strings.Cut(msg, ": "); ok {
+			msg = errmsg
 		}
-		return fmt.Errorf("%w: %s", e.err, detail)
+		msg, _, _ = strings.Cut(msg, "\n")
+		return fmt.Errorf("%w: %s", kind, msg)
 	}
-	return err
+	_, msg, ok := strings.Cut(err.Error(), "SQLite error: ")
+	if !ok {
+		return err
+	}
+	msg, _, _ = strings.Cut(msg, "\n")
+	head, _, _ := strings.Cut(msg, " constraint failed")
+	kind, ok := libsqlKinds[head]
+	if !ok {
+		return err
+	}
+	return fmt.Errorf("%w: %s", kind, msg)
 }
