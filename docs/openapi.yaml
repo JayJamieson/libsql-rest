@@ -1,0 +1,308 @@
+openapi: 3.0.3
+info:
+  title: libsql-rest
+  description: >
+    REST API over the tables and views of a libSQL or SQLite database.
+
+
+    This spec is generic. `{table}` is any exposed table or view, and `{pk}` is a
+    row's primary key. Rows are open objects because their columns depend on the
+    database. A running server serves a spec with a typed model per table at
+    `/openapi.json`.
+  version: 1.0.0
+  license:
+    name: MIT
+servers:
+  - url: http://localhost:8080
+    description: Local server
+
+# The server enforces this only when auth is enabled.
+security:
+  - bearerAuth: []
+
+paths:
+  /api/tables:
+    get:
+      operationId: listTables
+      summary: List exposed tables and views
+      tags: [schema]
+      responses:
+        "200":
+          description: The tables and views the API exposes
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Table"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/{table}:
+    parameters:
+      - $ref: "#/components/parameters/Table"
+    get:
+      operationId: listRows
+      summary: List rows from a table or view
+      description: >
+        Any query parameter other than select, order, limit, and offset is a
+        filter of the form `column=op.value`. `op` is one of eq, neq, gt, gte,
+        lt, lte, like, ilike, in, or is. Put `not.` before it to negate it.
+        Example: `?age=gte.18&name=like.jo*&status=not.eq.archived`.
+      tags: [rows]
+      parameters:
+        - $ref: "#/components/parameters/Select"
+        - $ref: "#/components/parameters/Order"
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+        - name: filters
+          in: query
+          required: false
+          description: >
+            Column filters as `column=op.value`. This is a free-form map so that
+            generated clients can pass a filter on any column.
+          style: form
+          explode: true
+          schema:
+            type: object
+            additionalProperties:
+              type: string
+      responses:
+        "200":
+          description: Matching rows
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Row"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/ServerError"
+    post:
+      operationId: createRow
+      summary: Create a row
+      tags: [rows]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Row"
+      responses:
+        "201":
+          description: The created row, with database defaults filled in
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Row"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/{table}/{pk}:
+    parameters:
+      - $ref: "#/components/parameters/Table"
+      - $ref: "#/components/parameters/Pk"
+    get:
+      operationId: getRow
+      summary: Fetch a single row by primary key
+      tags: [rows]
+      responses:
+        "200":
+          description: The row
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Row"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/ServerError"
+    patch:
+      operationId: updateRow
+      summary: Update a row by primary key
+      tags: [rows]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Row"
+      responses:
+        "200":
+          description: The updated row
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Row"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "500":
+          $ref: "#/components/responses/ServerError"
+    delete:
+      operationId: deleteRow
+      summary: Delete a row by primary key
+      tags: [rows]
+      responses:
+        "204":
+          description: The row was deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        JWT bearer token. Every endpoint requires it when the server runs with
+        auth enabled. Otherwise the server ignores it.
+
+  parameters:
+    Table:
+      name: table
+      in: path
+      required: true
+      description: Name of an exposed table or view
+      schema:
+        type: string
+    Pk:
+      name: pk
+      in: path
+      required: true
+      description: Primary key value of the row
+      schema:
+        type: string
+    Select:
+      name: select
+      in: query
+      required: false
+      description: Comma-separated columns to return
+      schema:
+        type: string
+      example: id,name
+    Order:
+      name: order
+      in: query
+      required: false
+      description: >
+        Comma-separated ordering terms as `column[.asc|.desc][.nullsfirst|.nullslast]`.
+      schema:
+        type: string
+      example: age.desc,name.asc
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Maximum rows to return. Defaults to the server's max_page_size and cannot exceed it.
+      schema:
+        type: integer
+        minimum: 0
+    Offset:
+      name: offset
+      in: query
+      required: false
+      description: Number of rows to skip
+      schema:
+        type: integer
+        minimum: 0
+
+  schemas:
+    Table:
+      type: object
+      properties:
+        name:
+          type: string
+        type:
+          type: string
+          enum: [table, view]
+      required: [name, type]
+    Row:
+      type: object
+      description: >
+        A database row. Its properties are the table's columns, so this is an
+        open object.
+      additionalProperties: true
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+      required: [error]
+
+  responses:
+    BadRequest:
+      description: >
+        Unknown column or operator, malformed query string or body, write to a
+        view, a `{pk}` route on a table without a single-column primary key, or
+        a NOT NULL, CHECK, or type constraint failure
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing or invalid authentication token
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: No such table, view, or row. Tables hidden by allow_tables also return 404.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: UNIQUE, PRIMARY KEY, or FOREIGN KEY constraint failure
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    PayloadTooLarge:
+      description: Request body larger than 1 MiB
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ServerError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"

@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  release:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Tag
+        id: version
+        run: |
+          version=$(.github/next-version.sh)
+          git tag "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Build
+        env:
+          DIST: ${{ runner.temp }}/dist
+        run: |
+          # Outside the checkout, so earlier binaries can't mark later builds +dirty.
+          mkdir -p "$DIST"
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            goos=${target%/*}
+            goarch=${target#*/}
+            ext=""
+            if [ "$goos" = windows ]; then ext=.exe; fi
+            CGO_ENABLED=0 GOOS=$goos GOARCH=$goarch go build -trimpath -o "$DIST/libsql-rest_${goos}_${goarch}${ext}" .
+          done
+          cd "$DIST"
+          sha256sum libsql-rest_* > checksums.txt
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+          DIST: ${{ runner.temp }}/dist
+        run: gh release create "$VERSION" "$DIST"/* --target "$GITHUB_SHA" --generate-notes

@@ -19,3 +19,10 @@
 
 # Go workspace file
 go.work
+
+# Local databases, keys written by `libsql-rest keygen`, and the built binary
+*.db
+*.db-shm
+*.db-wal
+*.pem
+/libsql-rest
