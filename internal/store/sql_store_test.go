@@ -156,3 +156,112 @@ func TestInsertIntoViewIsReadOnly(t *testing.T) {
 		t.Errorf("err = %v, want ErrReadOnly", err)
 	}
 }
+
+func TestConstraintFailures(t *testing.T) {
+	db, err := sql.Open("sqlite", "file:"+t.Name()+"?mode=memory&cache=shared&_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	seed := []string{
+		`CREATE TABLE teams (id INTEGER PRIMARY KEY, name TEXT NOT NULL)`,
+		`CREATE TABLE people (id INTEGER PRIMARY KEY, email TEXT UNIQUE, age INTEGER CHECK (age >= 0), team_id INTEGER REFERENCES teams (id))`,
+		`INSERT INTO teams (id, name) VALUES (1, 'core')`,
+		`INSERT INTO people (id, email, age, team_id) VALUES (1, 'ada@example.com', 36, 1), (2, 'grace@example.com', 85, NULL)`,
+	}
+	for _, s := range seed {
+		if _, err := db.Exec(s); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+	}
+	s := store.NewSQLStore(db, schema.NewSQLIntrospector(db), store.Options{})
+	ctx := t.Context()
+
+	tests := []struct {
+		name string
+		run  func() error
+		want error
+		msg  string
+	}{
+		{
+			name: "duplicate unique value",
+			run: func() error {
+				_, err := s.Insert(ctx, "people", store.Row{"email": "ada@example.com"})
+				return err
+			},
+			want: store.ErrConflict,
+			msg:  "conflict: UNIQUE constraint failed: people.email",
+		},
+		{
+			name: "duplicate unique value on update",
+			run: func() error {
+				_, err := s.Update(ctx, "people", "2", store.Row{"email": "ada@example.com"})
+				return err
+			},
+			want: store.ErrConflict,
+			msg:  "conflict: UNIQUE constraint failed: people.email",
+		},
+		{
+			name: "duplicate primary key",
+			run: func() error {
+				_, err := s.Insert(ctx, "teams", store.Row{"id": 1, "name": "dup"})
+				return err
+			},
+			want: store.ErrConflict,
+			msg:  "conflict: UNIQUE constraint failed: teams.id",
+		},
+		{
+			name: "missing foreign row",
+			run: func() error {
+				_, err := s.Insert(ctx, "people", store.Row{"team_id": 99})
+				return err
+			},
+			want: store.ErrConflict,
+			msg:  "conflict: FOREIGN KEY constraint failed",
+		},
+		{
+			name: "delete a referenced row",
+			run:  func() error { return s.Delete(ctx, "teams", "1") },
+			want: store.ErrConflict,
+			msg:  "conflict: FOREIGN KEY constraint failed",
+		},
+		{
+			name: "null in a not null column",
+			run: func() error {
+				_, err := s.Insert(ctx, "teams", store.Row{"name": nil})
+				return err
+			},
+			want: store.ErrConstraint,
+			msg:  "constraint violation: NOT NULL constraint failed: teams.name",
+		},
+		{
+			name: "failed check",
+			run: func() error {
+				_, err := s.Insert(ctx, "people", store.Row{"age": -1})
+				return err
+			},
+			want: store.ErrConstraint,
+			msg:  "constraint violation: CHECK constraint failed: age >= 0",
+		},
+		{
+			name: "text in an integer primary key",
+			run: func() error {
+				_, err := s.Insert(ctx, "teams", store.Row{"id": "abc", "name": "x"})
+				return err
+			},
+			want: store.ErrConstraint,
+			msg:  "constraint violation: datatype mismatch",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.run()
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("err = %v, want %v", err, tt.want)
+			}
+			if err.Error() != tt.msg {
+				t.Errorf("message = %q, want %q", err.Error(), tt.msg)
+			}
+		})
+	}
+}
